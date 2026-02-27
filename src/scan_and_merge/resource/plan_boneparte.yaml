@@ -1,0 +1,23 @@
+# Surgical Plan Configuration
+# ---------------------------
+# Note(Daksh):
+# For femur hole1: Requires P1, P2, P3 to compute reference orientation (normal vector of plane).
+# For all other holes: Only requires P1 (drilling point), orientation uses reference from femur hole1.
+
+# ALL DIMENSIONS ARE IN MM
+
+plan1:
+  femur:
+    hole1:
+      p1: [21.33, -41.42, 14.42]
+      p2: [21.49, -39.92, 17.51]
+      p3: [19.85, -40.59, 15.99]
+    hole2:
+      p1: [-26.59, -39.63, 12.56]
+  tibia:
+    hole1:
+      p1: [-23.742, -35.28082, 21.70092]
+    hole2:
+      p1: [20.60691, -25.10947, 21.04682]
+
+

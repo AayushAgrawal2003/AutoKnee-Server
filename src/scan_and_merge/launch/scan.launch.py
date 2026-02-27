@@ -1,0 +1,239 @@
+"""
+Launch: Camera + Static TF + RViz + Scan Node + Detect Node
+
+Brings up:
+  1. RealSense camera (pointcloud + aligned depth)
+  2. Static TF: lbr_link_7 -> camera_link
+  3. RViz with scan_and_merge config
+  4. scan_and_merge_node (delayed, runs in xterm for interactive input)
+  5. detect_and_merge_node (optional, YOLO detection + filtered merging)
+
+Usage:
+  # Original scan workflow (unchanged)
+  ros2 launch scan_and_merge scan.launch.py
+
+  # Run YOLO detect node instead of scan node
+  ros2 launch scan_and_merge scan.launch.py \
+    run_detect:=true scan_node:=false \
+    weights:=~/weights/best.pt \
+    load_waypoints:=~/scan_output/waypoints.npy
+
+  # Run both nodes simultaneously (scan captures raw, detect captures filtered)
+  ros2 launch scan_and_merge scan.launch.py \
+    run_detect:=true \
+    weights:=~/weights/best.pt \
+    load_waypoints:=~/scan_output/waypoints.npy
+
+  # Detect node with class filter and segmentation masks
+  ros2 launch scan_and_merge scan.launch.py \
+    run_detect:=true scan_node:=false \
+    weights:=~/weights/best-seg.pt \
+    use_seg_mask:=true \
+    target_classes:="0,1,2" \
+    confidence:=0.6 \
+    load_waypoints:=~/scan_output/waypoints.npy
+
+NOTE: The scan node needs interactive terminal input (ENTER to record / start).
+      It launches in an xterm window. Install if you don't have it:
+        sudo apt install xterm
+      Or set use_xterm:=false and run the node manually in a separate terminal.
+
+      The detect node does NOT need interactive input — it replays waypoints
+      automatically once launched.
+"""
+
+from launch import LaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument,
+    TimerAction,
+    ExecuteProcess,
+)
+from launch.conditions import IfCondition, UnlessCondition
+from launch.substitutions import (
+    LaunchConfiguration,
+    PathJoinSubstitution,
+    PythonExpression,
+)
+from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
+
+
+def generate_launch_description():
+
+    # ── Launch Configurations ──
+    cam_x = LaunchConfiguration("cam_x")
+    cam_y = LaunchConfiguration("cam_y")
+    cam_z = LaunchConfiguration("cam_z")
+    cam_roll = LaunchConfiguration("cam_roll")
+    cam_pitch = LaunchConfiguration("cam_pitch")
+    cam_yaw = LaunchConfiguration("cam_yaw")
+    load_waypoints = LaunchConfiguration("load_waypoints")
+    velocity_scaling = LaunchConfiguration("velocity_scaling")
+    scan = LaunchConfiguration("scan")
+    use_xterm = LaunchConfiguration("use_xterm")
+    launch_rviz = LaunchConfiguration("rviz")
+
+    # Detect node configs
+    run_detect = LaunchConfiguration("run_detect")
+    scan_node_enabled = LaunchConfiguration("scan_node")
+    weights = LaunchConfiguration("weights")
+    target_classes = LaunchConfiguration("target_classes")
+    confidence = LaunchConfiguration("confidence")
+    use_seg_mask = LaunchConfiguration("use_seg_mask")
+
+    return LaunchDescription([
+
+        # ── Arguments: Camera mount transform ──
+        DeclareLaunchArgument("cam_x", default_value="0.03775",
+                              description="Camera X offset from lbr_link_7 (meters)"),
+        DeclareLaunchArgument("cam_y", default_value="-0.00900",
+                              description="Camera Y offset from lbr_link_7 (meters)"),
+        DeclareLaunchArgument("cam_z", default_value="0.18123",
+                              description="Camera Z offset from lbr_link_7 (meters)"),
+        DeclareLaunchArgument("cam_roll", default_value="3.14",
+                              description="Camera roll from lbr_link_7 (radians)"),
+        DeclareLaunchArgument("cam_pitch", default_value="-1.57079632679",
+                              description="Camera pitch from lbr_link_7 (radians)"),
+        DeclareLaunchArgument("cam_yaw", default_value="0",
+                              description="Camera yaw from lbr_link_7 (radians)"),
+
+        # ── Arguments: Scan node ──
+        DeclareLaunchArgument("load_waypoints", default_value="~/scan_output/waypoints.npy",
+                              description="Path to waypoints.npy"),
+        DeclareLaunchArgument("velocity_scaling", default_value="0.1",
+                              description="Robot velocity scaling 0.0-1.0"),
+        DeclareLaunchArgument("scan", default_value="true",
+                              description="Capture point clouds and images (false = replay only)"),
+        DeclareLaunchArgument("use_xterm", default_value="true",
+                              description="Launch scan node in xterm for interactive input"),
+        DeclareLaunchArgument("rviz", default_value="true",
+                              description="Launch RViz"),
+
+        # ── Arguments: Detect node ──
+        DeclareLaunchArgument("run_detect", default_value="false",
+                              description="Launch detect_and_merge_node"),
+        DeclareLaunchArgument("scan_node", default_value="true",
+                              description="Launch scan_and_merge_node (disable if only detecting)"),
+        DeclareLaunchArgument("weights", default_value="",
+                              description="Path to YOLO .pt weights"),
+        DeclareLaunchArgument("target_classes", default_value="",
+                              description="YOLO class IDs to keep (comma-sep or JSON list, empty = all)"),
+        DeclareLaunchArgument("confidence", default_value="0.5",
+                              description="YOLO confidence threshold"),
+        DeclareLaunchArgument("use_seg_mask", default_value="false",
+                              description="Use segmentation masks instead of bounding boxes"),
+
+        # ── 1. RealSense Camera ──
+        Node(
+            package="realsense2_camera",
+            executable="realsense2_camera_node",
+            name="camera",
+            namespace="camera_arm",
+            parameters=[{
+                "pointcloud.enable": True,
+                "pointcloud.stream_filter": 2,    # RS2_STREAM_COLOR
+                "pointcloud.stream_index_filter": 0,
+                "align_depth.enable": True,
+                "enable_color": True,
+                "depth_module.profile": "640x480x30",
+                "rgb_camera.profile": "640x480x30",
+            }],
+            output="screen",
+        ),
+
+        # ── 2. Static TF: lbr_link_7 -> camera_link ──
+        Node(
+            package="tf2_ros",
+            executable="static_transform_publisher",
+            name="camera_ee_tf",
+            arguments=[
+                "--x", cam_x,
+                "--y", cam_y,
+                "--z", cam_z,
+                "--roll", cam_roll,
+                "--pitch", cam_pitch,
+                "--yaw", cam_yaw,
+                "--frame-id", "lbr_link_7",
+                "--child-frame-id", "camera_link",
+            ],
+            output="screen",
+        ),
+
+        # ── 3. RViz ──
+        Node(
+            condition=IfCondition(launch_rviz),
+            package="rviz2",
+            executable="rviz2",
+            name="rviz2",
+            arguments=["-d", PathJoinSubstitution([
+                FindPackageShare("scan_and_merge"), "rviz", "main.rviz"
+            ])],
+            output="screen",
+        ),
+
+        # ── 4. Scan Node (original, in xterm) ──
+        TimerAction(
+            period=4.0,
+            actions=[
+                # Option A: xterm (interactive)
+                ExecuteProcess(
+                    condition=IfCondition(PythonExpression([
+                        "'", scan_node_enabled, "' == 'true' and '",
+                        use_xterm, "' == 'true'",
+                    ])),
+                    cmd=[
+                        "xterm", "-e",
+                        "bash", "-c",
+                        PythonExpression([
+                            "'source ~/lbr-stack/install/setup.bash && "
+                            "ros2 run scan_and_merge scan_and_merge_node --ros-args"
+                            " -p load_waypoints:=",
+                            "\"'", " + '", load_waypoints, "' + '", "\"'",
+                            " + '", " -p velocity_scaling:=", "' + '", velocity_scaling, "'",
+                            " + '", " -p scan:=", "' + '", scan, "'",
+                            " + '", "; exec bash'",
+                        ]),
+                    ],
+                    output="screen",
+                ),
+                # Option B: inline (no interactive input)
+                Node(
+                    condition=IfCondition(PythonExpression([
+                        "'", scan_node_enabled, "' == 'true' and '",
+                        use_xterm, "' == 'false'",
+                    ])),
+                    package="scan_and_merge",
+                    executable="scan_and_merge_node",
+                    name="scan_and_merge_node",
+                    output="screen",
+                    parameters=[{
+                        "load_waypoints": load_waypoints,
+                        "velocity_scaling": velocity_scaling,
+                        "scan": scan,
+                    }],
+                ),
+            ],
+        ),
+
+        # ── 5. Detect & Merge Node ──
+        TimerAction(
+            period=5.0,  # wait for camera + TF to be ready
+            actions=[
+                Node(
+                    condition=IfCondition(run_detect),
+                    package="scan_and_merge",
+                    executable="detect_and_merge_node",
+                    name="detect_and_merge_node",
+                    output="screen",
+                    parameters=[{
+                        "load_waypoints": load_waypoints,
+                        "weights": weights,
+                        "target_classes": target_classes,
+                        "confidence": confidence,
+                        "velocity_scaling": velocity_scaling,
+                        "use_seg_mask": use_seg_mask,
+                    }],
+                ),
+            ],
+        ),
+    ])

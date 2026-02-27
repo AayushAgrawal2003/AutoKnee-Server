@@ -1,0 +1,39 @@
+# Build
+build/
+install/
+log/
+*.egg-info/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# YOLO weights & training
+*.pt
+*.onnx
+runs/
+
+# Point cloud outputs
+detect_output/
+scan_output/
+*.ply
+*.npy
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ROS bags
+*.bag
+*.db3
+metadata.yaml
