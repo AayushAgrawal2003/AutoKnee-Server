@@ -43,7 +43,7 @@ class CloudPublisher(Node):
 
         # Auto-find latest if no file specified
         if not file_path or not os.path.exists(file_path):
-            detect_dir = os.path.expanduser("~/detect_output")
+            detect_dir = os.path.expanduser("~/detect_output")  
             candidates = sorted(glob.glob(os.path.join(detect_dir, "bone_*_raw_*.ply")))
             if candidates:
                 file_path = candidates[-1]

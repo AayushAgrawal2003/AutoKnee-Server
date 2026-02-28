@@ -64,15 +64,11 @@ def _print_cloud_stats(name, pcd):
 
 
 def register_bone(scan_points, scan_colors, reference_ply_path,
-                  coarse_method="fpfh", voxel_size=0.002):
+                  coarse_method="fpfh", voxel_size=0.002, init_transform=None):
     """
     Register reference PLY onto scan cloud.
 
     The SCAN is fixed (target). The REFERENCE is moved (source).
-    This is the standard ICP convention in Open3D:
-      registration_icp(source, target) → T that transforms source to match target.
-
-    So: T @ ref_point = aligned_ref_point (in same frame as scan = base frame)
 
     Args:
         scan_points:        (N, 3) bone scan in lbr_link_0 frame
@@ -80,6 +76,9 @@ def register_bone(scan_points, scan_colors, reference_ply_path,
         reference_ply_path: path to reference .ply model
         coarse_method:      "fpfh" or "centroid"
         voxel_size:         base voxel size
+        init_transform:     optional 4x4 numpy array from a previous good run.
+                            If provided, skips coarse alignment entirely and
+                            uses this as the ICP starting pose.
 
     Returns:
         dict:
@@ -109,10 +108,21 @@ def register_bone(scan_points, scan_colors, reference_ply_path,
               f"Ratio={scale_ratio:.1f}")
 
     # ── Coarse alignment ──
-    # source=ref_pcd, target=scan_pcd → T moves ref toward scan
-    if coarse_method == "fpfh":
+    if init_transform is not None:
+        print("    Coarse: using provided init transform (skipping FPFH/centroid)")
+        coarse_T = init_transform.copy()
+    elif coarse_method == "fpfh":
         print("    Coarse: FPFH RANSAC...")
         coarse_T = _fpfh_registration(ref_pcd, scan_pcd, voxel_size * 2)
+
+        # Check if FPFH actually worked — evaluate fitness at coarse result
+        eval_result = o3d.pipelines.registration.evaluate_registration(
+            ref_pcd, scan_pcd, voxel_size * 20, coarse_T
+        )
+        if eval_result.fitness < 0.1:
+            print(f"    FPFH failed (fitness={eval_result.fitness:.4f}), "
+                  f"falling back to centroid alignment...")
+            coarse_T = _centroid_alignment(ref_pcd, scan_pcd)
     else:
         print("    Coarse: centroid alignment...")
         coarse_T = _centroid_alignment(ref_pcd, scan_pcd)
@@ -123,9 +133,10 @@ def register_bone(scan_points, scan_colors, reference_ply_path,
     _print_cloud_stats("Ref after coarse", ref_coarse)
 
     # ── Fine: multi-scale ICP ──
+    # Use wider correspondence distances to handle rough coarse alignment
     print("    Fine: multi-scale point-to-plane ICP...")
-    scales = [voxel_size * 4, voxel_size * 2, voxel_size]
-    dists  = [voxel_size * 20, voxel_size * 10, voxel_size * 5]
+    scales = [voxel_size * 5, voxel_size * 2, voxel_size]
+    dists  = [voxel_size * 50, voxel_size * 20, voxel_size * 10]
 
     current_T = coarse_T.copy()
     for i, (vs, md) in enumerate(zip(scales, dists)):
@@ -151,6 +162,38 @@ def register_bone(scan_points, scan_colors, reference_ply_path,
     fitness = result.fitness
     rmse = result.inlier_rmse
     print(f"    Final: fitness={fitness:.4f}, RMSE={rmse:.6f}")
+
+    # If ICP failed badly, retry with centroid coarse alignment
+    if fitness < 0.3 and coarse_method == "fpfh" and init_transform is None:
+        print(f"    ICP fitness too low ({fitness:.4f}), retrying with centroid...")
+        coarse_T = _centroid_alignment(ref_pcd, scan_pcd)
+
+        current_T = coarse_T.copy()
+        for i, (vs, md) in enumerate(zip(scales, dists)):
+            src_d = ref_pcd.voxel_down_sample(vs)
+            tgt_d = scan_pcd.voxel_down_sample(vs)
+            src_d.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=vs*3, max_nn=30))
+            tgt_d.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=vs*3, max_nn=30))
+
+            result = o3d.pipelines.registration.registration_icp(
+                src_d, tgt_d,
+                max_correspondence_distance=md,
+                init=current_T,
+                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
+                    max_iteration=200, relative_fitness=1e-7, relative_rmse=1e-7,
+                ),
+            )
+            current_T = result.transformation
+            print(f"      Retry scale {i+1}: fitness={result.fitness:.4f}, RMSE={result.inlier_rmse:.6f}")
+
+        if result.fitness > fitness:
+            final_T = current_T
+            fitness = result.fitness
+            rmse = result.inlier_rmse
+            print(f"    Retry improved: fitness={fitness:.4f}, RMSE={rmse:.6f}")
+        else:
+            print(f"    Retry did not improve, keeping original")
 
     # Apply transform to reference → now in base frame
     aligned_ref = o3d.geometry.PointCloud(ref_pcd)

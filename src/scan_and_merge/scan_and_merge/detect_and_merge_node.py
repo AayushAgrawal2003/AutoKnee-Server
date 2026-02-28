@@ -24,6 +24,11 @@ Usage:
     -p target_classes:="[0, 1]"            # empty = all classes
     -p confidence:=0.5 \
     -p velocity_scaling:=0.1
+
+
+ros2 launch scan_and_merge scan.launch.py   run_detect:=true scan_node:=false   weights:=$HOME/scan_output/best.pt   use_seg_mask:=true   confidence:=0.8   load_waypoints:=$HOME/scan_output/waypoints.npy
+
+
 """
 
 import rclpy
@@ -135,11 +140,24 @@ class DetectAndMergeNode(Node):
         pkg_share = get_package_share_directory("scan_and_merge")
         self.declare_parameter("register", True)
         self.declare_parameter("tibia_reference",
-            os.path.join(pkg_share, "resource", "tibia_shell.ply"))
+            os.path.join(pkg_share, "resource", "tibia.ply"))
         self.declare_parameter("femur_reference",
-            os.path.join(pkg_share, "resource", "femur_shell.ply"))
+            os.path.join(pkg_share, "resource", "femur.ply"))
         self.declare_parameter("icp_coarse_method", "fpfh")
         self.declare_parameter("icp_voxel_size", 0.002)
+
+        """
+        General Good registration saved here for scans
+        ~/detect_output/tibia_icp_T_ref2base_20260227_201636.npy
+        ~/detect_output/femur_icp_T_ref2base_20260227_201636.npy
+        
+        For Full bone
+        
+        
+        """
+
+        self.declare_parameter("tibia_init_transform", "~/detect_output/tibia_icp_T_ref2base_20260227_202247.npy")  # path to .npy 4x4
+        self.declare_parameter("femur_init_transform", "~/detect_output/femur_icp_T_ref2base_20260227_202247.npy")  # path to .npy 4x4
 
         self.cb_group = ReentrantCallbackGroup()
 
@@ -276,6 +294,12 @@ class DetectAndMergeNode(Node):
         )
         self.icp_coarse = self.get_parameter("icp_coarse_method").get_parameter_value().string_value
         self.icp_voxel = self.get_parameter("icp_voxel_size").get_parameter_value().double_value
+        self.tibia_init_T_path = os.path.expanduser(
+            self.get_parameter("tibia_init_transform").get_parameter_value().string_value
+        )
+        self.femur_init_T_path = os.path.expanduser(
+            self.get_parameter("femur_init_transform").get_parameter_value().string_value
+        )
 
         # ── Parse target classes ──
         self.target_classes = self._parse_target_classes(target_cls_str)
@@ -904,11 +928,19 @@ class DetectAndMergeNode(Node):
                 f"{'='*60}"
             )
 
+            # Load initial transform if provided
+            init_T = None
+            init_T_path = self.tibia_init_T_path if bone_name == "tibia" else self.femur_init_T_path
+            if init_T_path and os.path.exists(init_T_path):
+                init_T = np.load(init_T_path)
+                self.get_logger().info(f"  Using init transform: {init_T_path}")
+
             try:
                 result = register_bone(
                     pts, cols, ref_path,
                     coarse_method=self.icp_coarse,
                     voxel_size=self.icp_voxel,
+                    init_transform=init_T,
                 )
             except Exception as e:
                 self.get_logger().error(f"  Registration failed for {bone_name}: {e}")
