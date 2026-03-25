@@ -1,4 +1,4 @@
-# NEEpolean — YOLO-Guided Bone Scanning & Registration
+# AUTOKnee
 
 ROS 2 (Humble) package for autonomous bone scanning using a **KUKA LBR Med 7** manipulator with a wrist-mounted **Intel RealSense** depth camera. The system moves the robot through taught waypoints, detects bones with a YOLO segmentation model, builds per-bone point clouds, denoises them, and registers them against reference CAD/mesh models using ICP.
 
