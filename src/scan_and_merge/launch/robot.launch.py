@@ -4,20 +4,25 @@ Launch: KUKA Hardware + MoveIt
 Brings up:
   1. lbr_bringup hardware (robot driver, controllers, robot_state_publisher)
   2. MoveIt move_group
+  3. EE pose publisher (/ee_pose topic)
 
 Usage:
   ros2 launch scan_and_merge robot.launch.py
   ros2 launch scan_and_merge robot.launch.py model:=med14
 """
 
+import os
+
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
     TimerAction,
+    ExecuteProcess,
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -47,6 +52,14 @@ def generate_launch_description():
             }.items(),
         ),
 
+        # ── Tool Tip Frame (10mm X, 10mm Z offset from flange) ──
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            arguments=['--x', '0.01', '--z', '0.01',
+                       '--frame-id', 'link_ee', '--child-frame-id', 'ee_marker_center'],
+        ),
+
         # ── 2. MoveIt (delayed to let hardware connect first) ──
         TimerAction(
             period=5.0,
@@ -62,6 +75,18 @@ def generate_launch_description():
                         "mode": "hardware",
                         "rviz": "false",
                     }.items(),
+                ),
+            ],
+        ),
+
+        # ── 3. EE Pose Publisher (delayed to let TF tree populate) ──
+        TimerAction(
+            period=3.0,
+            actions=[
+                Node(
+                    package='scan_and_merge',
+                    executable='marker_publisher',
+                    output='screen',
                 ),
             ],
         ),
