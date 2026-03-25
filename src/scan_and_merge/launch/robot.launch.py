@@ -56,6 +56,7 @@ def generate_launch_description():
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
+            # TODO: Change the x z and rotation values to match actual transform
             arguments=['--x', '0.01', '--z', '0.01',
                        '--frame-id', 'link_ee', '--child-frame-id', 'ee_marker_center'],
         ),
