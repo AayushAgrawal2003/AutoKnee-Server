@@ -18,7 +18,6 @@ setup(
     maintainer_email="m.huber_1994@hotmail.de",
     description="MoveIt demos for the LBRs.",
     license="Apache-2.0",
-    tests_require=["pytest"],
     entry_points={
         "console_scripts": [
             "forward_keyboard = scripts.forward_keyboard:main",

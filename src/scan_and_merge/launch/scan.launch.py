@@ -1,5 +1,5 @@
 """
-Launch: Camera + Static TF + RViz + Scan Node + Detect Node
+Launch: Camera + Static TF + RViz + Scan Node + Detect Node + Waypoint Viz
 
 Brings up:
   1. RealSense camera (pointcloud + aligned depth)
@@ -7,10 +7,16 @@ Brings up:
   3. RViz with scan_and_merge config
   4. scan_and_merge_node (delayed, runs in xterm for interactive input)
   5. detect_and_merge_node (optional, YOLO detection + filtered merging)
+  6. waypoint_visualizer (optional, shows waypoint trajectory in RViz)
 
 Usage:
   # Original scan workflow (unchanged)
   ros2 launch scan_and_merge scan.launch.py
+
+  # Just visualize waypoints in RViz (no robot motion)
+  ros2 launch scan_and_merge scan.launch.py \
+    scan_node:=false visualize_waypoints:=true \
+    load_waypoints:=~/scan_output/waypoints.npy
 
   # Run YOLO detect node instead of scan node
   ros2 launch scan_and_merge scan.launch.py \
@@ -18,19 +24,10 @@ Usage:
     weights:=~/weights/best.pt \
     load_waypoints:=~/scan_output/waypoints.npy
 
-  # Run both nodes simultaneously (scan captures raw, detect captures filtered)
+  # Visualize waypoints AND run detect node
   ros2 launch scan_and_merge scan.launch.py \
-    run_detect:=true \
+    run_detect:=true scan_node:=false visualize_waypoints:=true \
     weights:=~/weights/best.pt \
-    load_waypoints:=~/scan_output/waypoints.npy
-
-  # Detect node with class filter and segmentation masks
-  ros2 launch scan_and_merge scan.launch.py \
-    run_detect:=true scan_node:=false \
-    weights:=~/weights/best-seg.pt \
-    use_seg_mask:=true \
-    target_classes:="0,1,2" \
-    confidence:=0.6 \
     load_waypoints:=~/scan_output/waypoints.npy
 
 NOTE: The scan node needs interactive terminal input (ENTER to record / start).
@@ -81,6 +78,9 @@ def generate_launch_description():
     confidence = LaunchConfiguration("confidence")
     use_seg_mask = LaunchConfiguration("use_seg_mask")
 
+    # Waypoint visualizer
+    visualize_waypoints = LaunchConfiguration("visualize_waypoints")
+
     return LaunchDescription([
 
         # ── Arguments: Camera mount transform ──
@@ -122,6 +122,10 @@ def generate_launch_description():
                               description="YOLO confidence threshold"),
         DeclareLaunchArgument("use_seg_mask", default_value="false",
                               description="Use segmentation masks instead of bounding boxes"),
+
+        # ── Arguments: Waypoint visualizer ──
+        DeclareLaunchArgument("visualize_waypoints", default_value="false",
+                              description="Launch waypoint visualizer (shows trajectory in RViz)"),
 
         # ── 1. RealSense Camera ──
         Node(
@@ -232,6 +236,26 @@ def generate_launch_description():
                         "confidence": confidence,
                         "velocity_scaling": velocity_scaling,
                         "use_seg_mask": use_seg_mask,
+                    }],
+                ),
+            ],
+        ),
+
+        # ── 6. Waypoint Visualizer ──
+        TimerAction(
+            period=2.0,  # start quickly, just needs TF
+            actions=[
+                Node(
+                    condition=IfCondition(visualize_waypoints),
+                    package="scan_and_merge",
+                    executable="waypoint_visualizer",
+                    name="waypoint_visualizer",
+                    output="screen",
+                    parameters=[{
+                        "waypoints_file": load_waypoints,
+                        "publish_rate": 1.0,
+                        "show_camera_frame": True,
+                        "use_tf_fk": True,
                     }],
                 ),
             ],

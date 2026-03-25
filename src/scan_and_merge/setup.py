@@ -28,6 +28,7 @@ setup(
             "replay_waypoints = scan_and_merge.replay_waypoints:main",
             "replay_trajectory = scan_and_merge.replay_trajectory:main",
             "cloud_publisher = scan_and_merge.cloud_publisher:main",
+            "waypoint_visualizer = scan_and_merge.waypoint_visualizer:main",
         ],
     },
 )
