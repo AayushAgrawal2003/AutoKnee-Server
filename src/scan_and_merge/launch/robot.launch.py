@@ -53,13 +53,7 @@ def generate_launch_description():
         ),
 
         # ── Tool Tip Frame (10mm X, 10mm Z offset from flange) ──
-        Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            # TODO: Change the x z and rotation values to match actual transform
-            arguments=['--x', '0.01', '--z', '0.01',
-                       '--frame-id', 'link_ee', '--child-frame-id', 'ee_marker_center'],
-        ),
+
 
         # ── 2. MoveIt (delayed to let hardware connect first) ──
         TimerAction(
@@ -86,7 +80,7 @@ def generate_launch_description():
             actions=[
                 Node(
                     package='scan_and_merge',
-                    executable='marker_publisher',
+                    executable='ee_publisher',
                     output='screen',
                 ),
             ],

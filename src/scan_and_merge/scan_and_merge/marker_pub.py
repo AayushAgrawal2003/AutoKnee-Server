@@ -10,7 +10,7 @@ class EEPosePublisher(Node):
 
         # --- Parameters ---
         self.declare_parameter('base_frame', 'link_0')
-        self.declare_parameter('ee_frame', 'ee_marker_center')
+        self.declare_parameter('ee_frame', 'link_ee')
         self.declare_parameter('rate', 50.0)  # Hz
 
         self.base_frame = self.get_parameter('base_frame').value
@@ -22,7 +22,7 @@ class EEPosePublisher(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # --- Publisher ---
-        self.pub = self.create_publisher(PoseStamped, '/ee_marker_center', 10)
+        self.pub = self.create_publisher(PoseStamped, '/link_ee', 10)
 
         # --- Timer ---
         self.timer = self.create_timer(1.0 / rate, self.publish_pose)
