@@ -302,7 +302,8 @@
             <visual>
                 <origin rpy="0 3.14157 0.0" xyz="0.0 0.0 0.0" />
                 <geometry>
-                    <mesh filename="package://lbr_description/meshes/med7/visual/worx+motor+mount+refined+3.stl" scale="0.001 0.001 0.001" />
+                    <!-- <mesh filename="package://lbr_description/meshes/med7/visual/worx+motor+mount+refined+3.stl" scale="0.001 0.001 0.001" /> -->
+                    <mesh filename="package://lbr_description/meshes/med7/visual/ee_mount.stl" scale="0.001 0.001 0.001" />
                 </geometry>
                 <material name="blue">
                     <color rgba="0.5 0.9 1 1.0" />
@@ -311,7 +312,8 @@
             <collision>
                 <origin rpy="0 3.14157 0" xyz="0.0 0.0 0.0" />
                 <geometry>
-                    <mesh filename="package://lbr_description/meshes/med7/collision/worx+motor+mount+refined+3.stl" scale="0.0011 0.0011 0.0011" />
+                    <!-- <mesh filename="package://lbr_description/meshes/med7/collision/worx+motor+mount+refined+3.stl" scale="0.0011 0.0011 0.0011" /> -->
+                    <mesh filename="package://lbr_description/meshes/med7/collision/ee_mount.stl" scale="0.0011 0.0011 0.0011" />
                 </geometry>
             </collision>
         </link>

@@ -4,13 +4,14 @@ from tf2_ros import Buffer, TransformListener
 from geometry_msgs.msg import PoseStamped
 
 
+
 class EEPosePublisher(Node):
     def __init__(self):
         super().__init__('marker_pub')
 
         # --- Parameters ---
-        self.declare_parameter('base_frame', 'link_0')
-        self.declare_parameter('ee_frame', 'link_ee')
+        self.declare_parameter('base_frame', 'lbr_link_0')
+        self.declare_parameter('ee_frame', 'tool_tip')
         self.declare_parameter('rate', 50.0)  # Hz
 
         self.base_frame = self.get_parameter('base_frame').value
@@ -22,7 +23,7 @@ class EEPosePublisher(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # --- Publisher ---
-        self.pub = self.create_publisher(PoseStamped, '/link_ee', 10)
+        self.pub = self.create_publisher(PoseStamped, '/ee_marker_pos', 10)
 
         # --- Timer ---
         self.timer = self.create_timer(1.0 / rate, self.publish_pose)
@@ -42,6 +43,12 @@ class EEPosePublisher(Node):
             msg.pose.orientation = t.transform.rotation
 
             self.pub.publish(msg)
+            """
+            Red: X 
+            Blue: Z
+            Green: Y            
+            Axis rep 
+            """
 
         except Exception as e:
             self.get_logger().warn(f'TF lookup failed: {e}', throttle_duration_sec=2.0)

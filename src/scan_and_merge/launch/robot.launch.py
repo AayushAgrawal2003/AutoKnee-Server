@@ -85,4 +85,12 @@ def generate_launch_description():
                 ),
             ],
         ),
-    ])
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+        #     arguments=['--x', '0.0732', '--z', '0.107', '--y', '-0.00179',
+        #             '--frame-id', 'lbr_link_7', '--child-frame-id', 'tool_tip'], 
+        arguments=['--x', '0.0732', '--z', '0.107', '--y', '-0.00179',
+           '--roll', '0', '--pitch', '1.5708', '--yaw', '0x',
+           '--frame-id', 'lbr_link_7', '--child-frame-id', 'tool_tip']
+    )])
