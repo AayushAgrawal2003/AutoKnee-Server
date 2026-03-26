@@ -4,11 +4,11 @@ Unified IR tracking + camera-to-KUKA transform node.
 Single ROS 2 node that handles the full pipeline:
   1. Discovers and connects to the Polaris Vega camera
   2. Tracks all 3 ROM tools (femur, tibia, end-effector) with EKF smoothing
-  3. Subscribes to /istar_global for the EE tracker ROM origin in KUKA base frame
+  3. Subscribes to /ee_marker_pos for the EE tracker ROM origin in KUKA base frame
      (this is KUKA FK + constant CAD offset, published by upstream KUKA node)
-  4. One-shot calibration: computes T_kuka_cam from initial /istar_global vs Polaris EE
+  4. One-shot calibration: computes T_kuka_cam from initial /ee_marker_pos vs Polaris EE
   5. Publishes all tracker 6-DOF poses in KUKA base frame
-  6. Publishes registration drift (live comparison of transformed Polaris vs /istar_global)
+  6. Publishes registration drift (live comparison of transformed Polaris vs /ee_marker_pos)
 
 Calibration math:
     T_kuka_cam = T_kuka_rom_initial @ inv(T_cam_rom_initial)
@@ -18,11 +18,11 @@ Continuous output:
 
 Drift (published every frame, logged every 2s):
     predicted = T_kuka_cam @ T_cam_rom_live        (frozen transform x live Polaris)
-    actual    = latest /istar_global reading        (live KUKA FK + offset)
+    actual    = latest /ee_marker_pos reading       (live KUKA FK + offset)
     drift_m   = ||predicted.position - actual.position||
 
 Subscriptions:
-    /istar_global    PoseStamped   ISTAR ROM origin in KUKA base frame (meters)
+    /ee_marker_pos    PoseStamped   ISTAR ROM origin in KUKA base frame (meters)
 
 Publications:
     /kuka_frame/pose_ee           PoseStamped   EE tracker in KUKA base frame
@@ -31,32 +31,31 @@ Publications:
     /kuka_frame/drift             Float64       Translational drift magnitude (meters)
 
 Usage:
-    python3 ir_tracking_node.py
-    python3 ir_tracking_node.py --hz 50 --ip 169.254.9.239
+    ros2 run ir_tracking ir_tracking_node
+    ros2 run ir_tracking ir_tracking_node --ros-args -p hz:=50.0 -p vega_ip:=169.254.9.239
 """
 
-import sys
 import os
+import sys
 import time
-import argparse
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vega_discover import discover_vega, VegaNotFoundError
-from pose_ekf import PoseEKF
+from ir_tracking.vega_discover import discover_vega, VegaNotFoundError
+from ir_tracking.pose_ekf import PoseEKF
 from sksurgerynditracker.nditracker import NDITracker
 
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import Float64
+from ament_index_python.packages import get_package_share_directory
 
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-ROM_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "roms"))
+ROM_DIR = os.path.join(get_package_share_directory('ir_tracking'), 'roms')
 
 # (rom_filename, output_topic, x_correction_mm)
 # Index 0 = femur, 1 = tibia, 2 = EE (ISTAR)
@@ -185,8 +184,17 @@ def rotation_matrix_to_euler_zyx(R):
 
 class IRTrackingNode(Node):
 
-    def __init__(self, hz, vega_ip):
+    def __init__(self):
         super().__init__('ir_tracking_node')
+
+        # ── ROS 2 Parameters ──────────────────────────────────────────────
+        self.declare_parameter('hz', 50.0)
+        self.declare_parameter('vega_ip', '')
+
+        hz = self.get_parameter('hz').value
+        vega_ip = self.get_parameter('vega_ip').value
+        if not vega_ip:
+            vega_ip = None
 
         # ── Resolve ROM files ────────────────────────────────────────────
         self.romfiles = []
@@ -225,14 +233,14 @@ class IRTrackingNode(Node):
         # ── Calibration state ────────────────────────────────────────────
         self.calibrated = False
         self.T_kuka_cam = None
-        self._latest_istar_global = None      # from /istar_global subscription
+        self._latest_istar_global = None      # from /ee_marker_pos subscription
         self._latest_cam_ee_matrix = None      # from Polaris (4x4, meters)
         self._drift_m = None
 
         # ── ROS subscription: ISTAR ROM origin in KUKA base frame ────────
         self.create_subscription(
             PoseStamped, '/ee_marker_pos', self._istar_global_cb, 10)
-        self.get_logger().info("Subscribed to ee_marker_pos (KUKA EE + CAD offset)")
+        self.get_logger().info("Subscribed to /ee_marker_pos (KUKA EE + CAD offset)")
 
         # ── ROS publishers ───────────────────────────────────────────────
         self.pose_pubs = []
@@ -246,19 +254,12 @@ class IRTrackingNode(Node):
         self.create_timer(2.0, self._log_status)
 
         self.get_logger().info(
-            f"Running at {hz:.0f} Hz.  Waiting for /istar_global to calibrate...")
+            f"Running at {hz:.0f} Hz.  Waiting for /ee_marker_pos to calibrate...")
 
-    # ── /istar_global callback ───────────────────────────────────────────
+    # ── /ee_marker_pos callback ───────────────────────────────────────────
 
     def _istar_global_cb(self, msg):
         self._latest_istar_global = msg
-        p = msg.pose.position
-        q = msg.pose.orientation
-        # self.get_logger().info(
-        #     f"[IN  /ee_marker_pos]  "
-        #     f"xyz=({p.x:.4f}, {p.y:.4f}, {p.z:.4f})  "
-        #     f"quat=({q.x:.4f}, {q.y:.4f}, {q.z:.4f}, {q.w:.4f})"
-        # )
 
     # ── Main loop: poll Vega, calibrate, transform, publish ──────────────
 
@@ -331,21 +332,13 @@ class IRTrackingNode(Node):
             T_kuka = self.T_kuka_cam @ cam_poses[i]
             out_msg = matrix_to_pose_stamped(T_kuka, 'lbr_link_0', stamp)
             self.pose_pubs[i].publish(out_msg)
-            if i == EE_INDEX:
-                p = out_msg.pose.position
-                q = out_msg.pose.orientation
-                # self.get_logger().info(
-                #     f"[OUT /kuka_frame/pose_ee]  "
-                #     f"xyz=({p.x:.4f}, {p.y:.4f}, {p.z:.4f})  "
-                #     f"quat=({q.x:.4f}, {q.y:.4f}, {q.z:.4f}, {q.w:.4f})"
-                # )
 
         # ── 5. Drift computation and publishing ──────────────────────────
         if (self._latest_istar_global is not None
                 and cam_poses[EE_INDEX] is not None):
             # Predicted: transform live Polaris EE using frozen calibration
             T_predicted = self.T_kuka_cam @ cam_poses[EE_INDEX]
-            # Actual: latest /istar_global (KUKA FK + CAD offset)
+            # Actual: latest /ee_marker_pos (KUKA FK + CAD offset)
             T_actual = pose_msg_to_matrix(self._latest_istar_global)
 
             drift_vec = T_predicted[:3, 3] - T_actual[:3, 3]
@@ -363,7 +356,7 @@ class IRTrackingNode(Node):
             has_polaris = self._latest_cam_ee_matrix is not None
             self.get_logger().info(
                 f"Waiting to calibrate...  "
-                f"/istar_global: {'OK' if has_istar else 'waiting'}  "
+                f"/ee_marker_pos: {'OK' if has_istar else 'waiting'}  "
                 f"Polaris EE: {'OK' if has_polaris else 'waiting'}")
             return
         if self._drift_m is not None:
@@ -387,26 +380,11 @@ class IRTrackingNode(Node):
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Unified IR tracking + camera-to-KUKA transform node. "
-                    "Discovers Polaris Vega, tracks all ROMs, calibrates "
-                    "against /istar_global, and publishes poses in KUKA frame.",
-    )
-    parser.add_argument(
-        "--hz", type=float, default=50.0,
-        help="Poll/publish rate in Hz (default: 50)",
-    )
-    parser.add_argument(
-        "--ip", default=None,
-        help="Known Vega IP to skip discovery (e.g. 169.254.9.239)",
-    )
-    args, ros_args = parser.parse_known_args()
-
-    rclpy.init(args=ros_args if ros_args else None)
+def main(args=None):
+    rclpy.init(args=args)
 
     try:
-        node = IRTrackingNode(hz=args.hz, vega_ip=args.ip)
+        node = IRTrackingNode()
     except (FileNotFoundError, VegaNotFoundError):
         rclpy.shutdown()
         sys.exit(1)

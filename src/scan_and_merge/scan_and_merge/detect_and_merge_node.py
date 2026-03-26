@@ -36,6 +36,7 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 
 from sensor_msgs.msg import JointState, Image, CameraInfo, PointCloud2, PointField
@@ -202,11 +203,16 @@ class DetectAndMergeNode(Node):
             callback_group=self.cb_group,
         )
 
-        # ── PointCloud2 Publishers (for registered bones in RViz) ──
-        self.pub_tibia_aligned = self.create_publisher(PointCloud2, "/registered/tibia", 10)
-        self.pub_femur_aligned = self.create_publisher(PointCloud2, "/registered/femur", 10)
-        self.pub_tibia_ref = self.create_publisher(PointCloud2, "/reference/tibia", 10)
-        self.pub_femur_ref = self.create_publisher(PointCloud2, "/reference/femur", 10)
+        # ── PointCloud2 Publishers (transient_local so bone_cloud_mover can latch) ──
+        latch_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        self.pub_tibia_aligned = self.create_publisher(PointCloud2, "/registered/tibia", latch_qos)
+        self.pub_femur_aligned = self.create_publisher(PointCloud2, "/registered/femur", latch_qos)
+        self.pub_tibia_ref = self.create_publisher(PointCloud2, "/reference/tibia", latch_qos)
+        self.pub_femur_ref = self.create_publisher(PointCloud2, "/reference/femur", latch_qos)
 
         # Messages to latch-publish (set after registration)
         self._registered_msgs = {}  # populated after ICP
@@ -406,12 +412,13 @@ class DetectAndMergeNode(Node):
             f"{'='*60}"
         )
 
-        # ── Keep publishing registered clouds at 1 Hz for RViz ──
+        # ── Publish registered clouds once (transient_local for bone_cloud_mover) ──
         if self._registered_msgs:
-            self.get_logger().info("  Publishing registered clouds to RViz (1 Hz loop)...")
-            while rclpy.ok():
-                self._publish_registered()
-                time.sleep(1.0)
+            self._publish_registered()
+            self.get_logger().info(
+                "  Published registered clouds (transient_local, one-shot). "
+                "bone_cloud_mover will handle live tracking."
+            )
 
     # ──────────────────────────────────────────────────────────────────
     # YOLO Detection — per-instance depth masking & back-projection
@@ -1065,7 +1072,7 @@ class DetectAndMergeNode(Node):
     # Periodic Publish (latch for RViz)
     # ──────────────────────────────────────────────────────────────────
     def _publish_registered(self):
-        """Publish registered clouds. Called from daemon thread loop."""
+        """Publish registered clouds (one-shot, transient_local)."""
         now = self.get_clock().now().to_msg()
 
         for key, pub in [

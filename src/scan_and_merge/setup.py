@@ -30,6 +30,7 @@ setup(
             "cloud_publisher = scan_and_merge.cloud_publisher:main",
             "waypoint_visualizer = scan_and_merge.waypoint_visualizer:main",
             "ee_publisher = scan_and_merge.marker_pub:main",
+            "bone_cloud_mover = scan_and_merge.bone_cloud_mover:main",
         ],
     },
 )

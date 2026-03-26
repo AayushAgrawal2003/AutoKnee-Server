@@ -202,6 +202,8 @@ def register_bone(scan_points, scan_colors, reference_ply_path,
 
     return {
         "transform": final_T,
+        "ref_points": np.asarray(ref_pcd.points),
+        "ref_colors": np.asarray(ref_pcd.colors) if ref_pcd.has_colors() else None,
         "aligned_ref_points": np.asarray(aligned_ref.points),
         "aligned_ref_colors": np.asarray(aligned_ref.colors) if aligned_ref.has_colors() else None,
         "scan_points": np.asarray(scan_pcd.points),

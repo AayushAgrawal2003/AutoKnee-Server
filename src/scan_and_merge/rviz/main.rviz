@@ -14,6 +14,26 @@ Panels:
 Visualization Manager:
   Class: ""
   Displays:
+    # ── Grid (spatial reference) ──
+    - Alpha: 0.3
+      Cell Size: 0.1
+      Class: rviz_default_plugins/Grid
+      Color: 120; 120; 120
+      Enabled: true
+      Line Style:
+        Line Width: 0.029999999329447746
+        Value: Lines
+      Name: Grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 20
+      Reference Frame: lbr_link_0
+      Value: true
+    # ── Robot Model ──
     - Alpha: 1
       Class: rviz_default_plugins/RobotModel
       Collision Enabled: false
@@ -89,85 +109,20 @@ Visualization Manager:
       Update Interval: 0
       Value: true
       Visual Enabled: true
+    # ── TF Tree ──
     - Class: rviz_default_plugins/TF
       Enabled: true
       Frame Timeout: 15
       Frames:
         All Enabled: true
-        camera_aligned_depth_to_infra1_frame:
-          Value: true
-        camera_color_frame:
-          Value: true
-        camera_color_optical_frame:
-          Value: true
-        camera_depth_frame:
-          Value: true
-        camera_depth_optical_frame:
-          Value: true
-        camera_infra1_frame:
-          Value: true
-        camera_infra1_optical_frame:
-          Value: true
-        camera_infra2_frame:
-          Value: true
-        camera_infra2_optical_frame:
-          Value: true
-        camera_link:
-          Value: true
-        lbr_floating_link:
-          Value: true
-        lbr_link_0:
-          Value: true
-        lbr_link_1:
-          Value: true
-        lbr_link_2:
-          Value: true
-        lbr_link_3:
-          Value: true
-        lbr_link_4:
-          Value: true
-        lbr_link_5:
-          Value: true
-        lbr_link_6:
-          Value: true
-        lbr_link_7:
-          Value: true
-        lbr_link_ee:
-          Value: true
-      Marker Scale: 0.30000001192092896
+      Marker Scale: 0.20000000298023224
       Name: TF
-      Show Arrows: true
+      Show Arrows: false
       Show Axes: true
-      Show Names: true
-      Tree:
-        lbr_floating_link:
-          lbr_link_0:
-            lbr_link_1:
-              lbr_link_2:
-                lbr_link_3:
-                  lbr_link_4:
-                    lbr_link_5:
-                      lbr_link_6:
-                        lbr_link_7:
-                          camera_link:
-                            camera_aligned_depth_to_infra1_frame:
-                              camera_infra1_optical_frame:
-                                {}
-                            camera_color_frame:
-                              camera_color_optical_frame:
-                                {}
-                            camera_depth_frame:
-                              camera_depth_optical_frame:
-                                {}
-                            camera_infra1_frame:
-                              {}
-                            camera_infra2_frame:
-                              camera_infra2_optical_frame:
-                                {}
-                          lbr_link_ee:
-                            {}
+      Show Names: false
       Update Interval: 0
       Value: true
+    # ── Camera RGB ──
     - Class: rviz_default_plugins/Image
       Enabled: true
       Max Value: 1
@@ -182,6 +137,7 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /camera_arm/camera/color/image_rect_raw
       Value: true
+    # ── Live Depth PointCloud ──
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -200,7 +156,7 @@ Visualization Manager:
       Max Intensity: 4096
       Min Color: 0; 0; 0
       Min Intensity: 0
-      Name: PointCloud2
+      Name: Live Depth
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 3
@@ -216,77 +172,73 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
-    # ── Registered Tibia (aligned scan) ──
-    - Alpha: 1
-      Autocompute Intensity Bounds: true
-      Autocompute Value Bounds:
-        Max Value: 10
-        Min Value: -10
-        Value: true
-      Axis: Z
-      Channel Name: intensity
-      Class: rviz_default_plugins/PointCloud2
-      Color: 0; 255; 100
-      Color Transformer: RGB8
-      Decay Time: 2
+    # ══════════════════════════════════════════════════════════════════════
+    # IR TRACKER POSES (from ir_tracking_node)
+    # ══════════════════════════════════════════════════════════════════════
+    # ── Femur Tracker Pose ──
+    - Axes Length: 0.10000000149011612
+      Axes Radius: 0.009999999776482582
+      Class: rviz_default_plugins/Pose
+      Color: 255; 120; 0
       Enabled: true
-      Invert Rainbow: false
-      Max Color: 255; 255; 255
-      Max Intensity: 4096
-      Min Color: 0; 0; 0
-      Min Intensity: 0
-      Name: Tibia Aligned
-      Position Transformer: XYZ
-      Selectable: true
-      Size (Pixels): 3
-      Size (m): 0.003000000026077032
-      Style: Flat Squares
+      Head Length: 0.015000000000000001
+      Head Radius: 0.007000000000000001
+      Name: Femur Tracker
+      Shaft Length: 0.05000000000000001
+      Shaft Radius: 0.004000000000000001
+      Shape: Axes
       Topic:
         Depth: 5
         Durability Policy: Volatile
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /registered/tibia
-      Use Fixed Frame: true
-      Use rainbow: false
+        Value: /kuka_frame/bone_pose_femur
       Value: true
-    # ── Reference Tibia (shell model) ──
-    - Alpha: 0.4
-      Autocompute Intensity Bounds: true
-      Autocompute Value Bounds:
-        Max Value: 10
-        Min Value: -10
-        Value: true
-      Axis: Z
-      Channel Name: intensity
-      Class: rviz_default_plugins/PointCloud2
-      Color: 0; 180; 80
-      Color Transformer: FlatColor
-      Decay Time: 2
+    # ── Tibia Tracker Pose ──
+    - Axes Length: 0.10000000149011612
+      Axes Radius: 0.009999999776482582
+      Class: rviz_default_plugins/Pose
+      Color: 0; 220; 100
       Enabled: true
-      Invert Rainbow: false
-      Max Color: 255; 255; 255
-      Max Intensity: 4096
-      Min Color: 0; 0; 0
-      Min Intensity: 0
-      Name: Tibia Reference
-      Position Transformer: XYZ
-      Selectable: true
-      Size (Pixels): 2
-      Size (m): 0.0020000000949949026
-      Style: Flat Squares
+      Head Length: 0.015000000000000001
+      Head Radius: 0.007000000000000001
+      Name: Tibia Tracker
+      Shaft Length: 0.05000000000000001
+      Shaft Radius: 0.004000000000000001
+      Shape: Axes
       Topic:
         Depth: 5
         Durability Policy: Volatile
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /reference/tibia
-      Use Fixed Frame: true
-      Use rainbow: false
+        Value: /kuka_frame/bone_pose_tibia
       Value: true
-    # ── Registered Femur (aligned scan) ──
+    # ── EE Tracker Pose (IR) ──
+    - Axes Length: 0.10000000149011612
+      Axes Radius: 0.009999999776482582
+      Class: rviz_default_plugins/Pose
+      Color: 0; 150; 255
+      Enabled: true
+      Head Length: 0.015000000000000001
+      Head Radius: 0.007000000000000001
+      Name: EE Tracker (IR)
+      Shaft Length: 0.05000000000000001
+      Shaft Radius: 0.004000000000000001
+      Shape: Axes
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /kuka_frame/pose_ee
+      Value: true
+    # ══════════════════════════════════════════════════════════════════════
+    # TRACKED BONE CLOUDS (moving with IR trackers via bone_cloud_mover)
+    # ══════════════════════════════════════════════════════════════════════
+    # ── Tracked Femur Scan ──
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -298,14 +250,14 @@ Visualization Manager:
       Class: rviz_default_plugins/PointCloud2
       Color: 255; 100; 0
       Color Transformer: RGB8
-      Decay Time: 2
+      Decay Time: 0
       Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
       Max Intensity: 4096
       Min Color: 0; 0; 0
       Min Intensity: 0
-      Name: Femur Aligned
+      Name: Tracked Femur Scan
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 3
@@ -317,12 +269,12 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /registered/femur
+        Value: /tracked/registered/femur
       Use Fixed Frame: true
       Use rainbow: false
       Value: true
-    # ── Reference Femur (shell model) ──
-    - Alpha: 0.4
+    # ── Tracked Femur Reference ──
+    - Alpha: 0.5
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
         Max Value: 10
@@ -333,14 +285,14 @@ Visualization Manager:
       Class: rviz_default_plugins/PointCloud2
       Color: 200; 80; 0
       Color Transformer: FlatColor
-      Decay Time: 2
+      Decay Time: 0
       Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
       Max Intensity: 4096
       Min Color: 0; 0; 0
       Min Intensity: 0
-      Name: Femur Reference
+      Name: Tracked Femur Reference
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 2
@@ -352,13 +304,226 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /reference/femur
+        Value: /tracked/reference/femur
       Use Fixed Frame: true
       Use rainbow: false
       Value: true
+    # ── Tracked Tibia Scan ──
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/PointCloud2
+      Color: 0; 255; 100
+      Color Transformer: RGB8
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: Tracked Tibia Scan
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.003000000026077032
+      Style: Flat Squares
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /tracked/registered/tibia
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: true
+    # ── Tracked Tibia Reference ──
+    - Alpha: 0.5
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/PointCloud2
+      Color: 0; 180; 80
+      Color Transformer: FlatColor
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: Tracked Tibia Reference
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.0020000000949949026
+      Style: Flat Squares
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /tracked/reference/tibia
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: true
+    # ══════════════════════════════════════════════════════════════════════
+    # STATIC ALIGNED CLOUDS (initial ICP result, before tracking)
+    # ══════════════════════════════════════════════════════════════════════
+    # ── Tibia Aligned (static) ──
+    - Alpha: 0.6
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/PointCloud2
+      Color: 0; 255; 100
+      Color Transformer: RGB8
+      Decay Time: 2
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: Tibia Aligned (static)
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.003000000026077032
+      Style: Flat Squares
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /registered/tibia
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: false
+    # ── Tibia Reference (static) ──
+    - Alpha: 0.3
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/PointCloud2
+      Color: 0; 180; 80
+      Color Transformer: FlatColor
+      Decay Time: 2
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: Tibia Reference (static)
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.0020000000949949026
+      Style: Flat Squares
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /reference/tibia
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: false
+    # ── Femur Aligned (static) ──
+    - Alpha: 0.6
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/PointCloud2
+      Color: 255; 100; 0
+      Color Transformer: RGB8
+      Decay Time: 2
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: Femur Aligned (static)
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.003000000026077032
+      Style: Flat Squares
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /registered/femur
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: false
+    # ── Femur Reference (static) ──
+    - Alpha: 0.3
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/PointCloud2
+      Color: 200; 80; 0
+      Color Transformer: FlatColor
+      Decay Time: 2
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: Femur Reference (static)
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.0020000000949949026
+      Style: Flat Squares
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /reference/femur
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: false
   Enabled: true
   Global Options:
-    Background Color: 48; 48; 48
+    Background Color: 35; 35; 35
     Fixed Frame: lbr_link_0
     Frame Rate: 30
   Name: root
@@ -394,7 +559,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 3.257775068283081
+      Distance: 2.5
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -409,7 +574,7 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.035000335425138474
+      Pitch: 0.30000001192092896
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz_default_plugins)
       Yaw: 1.5699999332427979

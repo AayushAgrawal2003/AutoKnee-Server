@@ -1,5 +1,5 @@
 """
-Launch: Camera + Static TF + RViz + Scan Node + Detect Node + Waypoint Viz
+Launch: Camera + Static TF + RViz + Scan Node + Detect Node + Waypoint Viz + Bone Cloud Mover
 
 Brings up:
   1. RealSense camera (pointcloud + aligned depth)
@@ -8,6 +8,7 @@ Brings up:
   4. scan_and_merge_node (delayed, runs in xterm for interactive input)
   5. detect_and_merge_node (optional, YOLO detection + filtered merging)
   6. waypoint_visualizer (optional, shows waypoint trajectory in RViz)
+  7. bone_cloud_mover (rigid-body tracking of aligned clouds with IR trackers)
 
 Usage:
   # Original scan workflow (unchanged)
@@ -81,6 +82,9 @@ def generate_launch_description():
     # Waypoint visualizer
     visualize_waypoints = LaunchConfiguration("visualize_waypoints")
 
+    # Bone cloud mover
+    run_bone_mover = LaunchConfiguration("run_bone_mover")
+
     return LaunchDescription([
 
         # ── Arguments: Camera mount transform ──
@@ -127,6 +131,10 @@ def generate_launch_description():
         DeclareLaunchArgument("visualize_waypoints", default_value="false",
                               description="Launch waypoint visualizer (shows trajectory in RViz)"),
 
+        # ── Arguments: Bone cloud mover ──
+        DeclareLaunchArgument("run_bone_mover", default_value="true",
+                              description="Launch bone cloud mover (tracks aligned clouds with IR trackers)"),
+
         # ── 1. RealSense Camera ──
         Node(
             package="realsense2_camera",
@@ -164,16 +172,6 @@ def generate_launch_description():
         ),
 
         # ── 3. RViz ──
-        Node(
-            condition=IfCondition(launch_rviz),
-            package="rviz2",
-            executable="rviz2",
-            name="rviz2",
-            arguments=["-d", PathJoinSubstitution([
-                FindPackageShare("scan_and_merge"), "rviz", "main.rviz"
-            ])],
-            output="screen",
-        ),
 
         # ── 4. Scan Node (original, in xterm) ──
         TimerAction(
@@ -259,5 +257,17 @@ def generate_launch_description():
                     }],
                 ),
             ],
+        ),
+
+        # ── 7. Bone Cloud Mover (tracks aligned clouds with IR trackers) ──
+        Node(
+            condition=IfCondition(run_bone_mover),
+            package="scan_and_merge",
+            executable="bone_cloud_mover",
+            name="bone_cloud_mover",
+            output="screen",
+            parameters=[{
+                "publish_rate": 20.0,
+            }],
         ),
     ])
