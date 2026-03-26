@@ -1,0 +1,4 @@
+scikit-surgerynditracker
+ndicapi
+PyQt6
+pyqtgraph
