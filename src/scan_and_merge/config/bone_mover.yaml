@@ -1,0 +1,5 @@
+bone_cloud_mover:
+  ros__parameters:
+    publish_rate: 20.0
+    ref_to_tracker_tibia: ""      # path to .npy calibration (or leave empty for live)
+    ref_to_tracker_femur: ""      # path to .npy calibration (or leave empty for live)

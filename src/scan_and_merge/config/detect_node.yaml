@@ -1,0 +1,38 @@
+detect_and_merge_node:
+  ros__parameters:
+
+    # ── Scan ──
+    load_waypoints: "~/scan_output/waypoints.npy"
+    weights: "~/scan_output/best.pt"
+    target_classes: ""            # comma-sep or JSON list, empty = all
+    confidence: 0.8
+    velocity_scaling: 0.1
+    max_depth_m: 1.0
+    settle_time: 1.5
+    use_seg_mask: true
+
+    # ── Denoise ──
+    denoise: true
+    cross_cloud_dist: 0.005       # meters
+    cross_cloud_min_views: 2
+    sor_k: 20
+    sor_std: 2.0
+    radius_filter: 0.01           # meters
+    radius_min_neighbors: 5
+    denoise_voxel_size: 0.001     # meters
+    smooth_k: 10
+    smooth_iterations: 1
+
+    # ── ICP Registration ──
+    register: true
+    tibia_reference: "resource/tibia.ply"    # relative to package share, or absolute path
+    femur_reference: "resource/femur.ply"    # relative to package share, or absolute path
+    icp_coarse_method: "fpfh"
+    icp_voxel_size: 0.002
+    tibia_init_transform: "~/detect_output/tibia_icp_T_ref2base_20260227_202247.npy"
+    femur_init_transform: "~/detect_output/femur_icp_T_ref2base_20260227_202247.npy"
+
+    # ── Multi-Orientation Calibration ──
+    multi_orientation: false
+    n_orientations: 3
+    tracker_avg_samples: 50

@@ -147,8 +147,7 @@ class DetectAndMergeNode(Node):
         self.declare_parameter("register", True)
         self.declare_parameter("tibia_reference",
             os.path.join(pkg_share, "resource", "tibia.ply"))
-        self.declare_parameter("femur_reference",
-            os.path.join(pkg_share, "resource", "femur.ply"))
+
         self.declare_parameter("icp_coarse_method", "fpfh")
         self.declare_parameter("icp_voxel_size", 0.002)
 
@@ -162,8 +161,11 @@ class DetectAndMergeNode(Node):
         
         """
 
-        self.declare_parameter("tibia_init_transform", "~/detect_output/tibia_icp_T_ref2base_20260227_202247.npy")  # path to .npy 4x4
-        self.declare_parameter("femur_init_transform", "~/detect_output/femur_icp_T_ref2base_20260227_202247.npy")  # path to .npy 4x4
+        self.declare_parameter("tibia_init_transform", "")  # path to .npy 4x4
+        self.declare_parameter("femur_init_transform", "")  # path to .npy 4x4
+
+        # self.declare_parameter("tibia_init_transform", "~/detect_output/tibia_icp_T_ref2base_20260227_202247.npy")  # path to .npy 4x4
+        # self.declare_parameter("femur_init_transform", "~/detect_output/femur_icp_T_ref2base_20260227_202247.npy")  # path to .npy 4x4
 
         # Multi-orientation calibration params
         self.declare_parameter("multi_orientation", False)
@@ -337,12 +339,11 @@ class DetectAndMergeNode(Node):
 
         # Registration params
         self.do_register = self.get_parameter("register").get_parameter_value().bool_value
-        self.tibia_ref_path = os.path.expanduser(
-            self.get_parameter("tibia_reference").get_parameter_value().string_value
-        )
-        self.femur_ref_path = os.path.expanduser(
-            self.get_parameter("femur_reference").get_parameter_value().string_value
-        )
+        pkg_share = get_package_share_directory("scan_and_merge")
+        self.tibia_ref_path = self._resolve_ref_path(
+            self.get_parameter("tibia_reference").get_parameter_value().string_value, pkg_share)
+        self.femur_ref_path = self._resolve_ref_path(
+            self.get_parameter("femur_reference").get_parameter_value().string_value, pkg_share)
         self.icp_coarse = self.get_parameter("icp_coarse_method").get_parameter_value().string_value
         self.icp_voxel = self.get_parameter("icp_voxel_size").get_parameter_value().double_value
         self.tibia_init_T_path = os.path.expanduser(
@@ -585,56 +586,59 @@ class DetectAndMergeNode(Node):
             if self._registered_msgs:
                 self._publish_registered()
 
-            # ── Ask user: keep or discard? ──
+            # ── Ask user: which bones to keep? ──
             cmd = self._wait_for_mo_command(
-                ["keep", "discard"],
+                ["both", "femur", "tibia", "neither"],
                 f"Orientation {orientation_idx+1} done. "
-                f"Publish 'keep' or 'discard' to /multi_orient/command"
+                f"Publish 'both', 'femur', 'tibia', or 'neither' to /multi_orient/command"
             )
 
-            if cmd == "keep":
-                # Store the ICP results + tracker poses for the solver
-                bone_tracker_map = {
-                    "tibia": T_tracker_tibia,
-                    "femur": T_tracker_femur,
-                }
+            accept_tibia = cmd in ("both", "tibia")
+            accept_femur = cmd in ("both", "femur")
 
-                for bone_name in ["tibia", "femur"]:
-                    T_tracker = bone_tracker_map.get(bone_name)
-                    if T_tracker is None:
-                        self.get_logger().warn(
-                            f"  No tracker pose for {bone_name}, skipping"
-                        )
-                        continue
+            bone_tracker_map = {
+                "tibia": T_tracker_tibia,
+                "femur": T_tracker_femur,
+            }
+            accept_map = {"tibia": accept_tibia, "femur": accept_femur}
 
-                    if bone_name not in self._last_icp_metrics:
-                        self.get_logger().warn(
-                            f"  No ICP result for {bone_name}, skipping"
-                        )
-                        continue
+            for bone_name in ["tibia", "femur"]:
+                if not accept_map[bone_name]:
+                    continue
 
-                    metrics = self._last_icp_metrics[bone_name]
-                    orientation_data[bone_name].append({
-                        "T_tracker": T_tracker.copy(),
-                        "T_icp": metrics["T_icp"].copy(),
-                        "fitness": metrics["fitness"],
-                        "rmse": metrics["rmse"],
-                        "orientation_idx": orientation_idx,
-                    })
-                    self.get_logger().info(
-                        f"  Stored orientation {orientation_idx+1} for {bone_name} "
-                        f"(fitness={metrics['fitness']:.4f}, rmse={metrics['rmse']:.6f})"
+                T_tracker = bone_tracker_map.get(bone_name)
+                if T_tracker is None:
+                    self.get_logger().warn(
+                        f"  No tracker pose for {bone_name}, skipping"
                     )
+                    continue
 
-                self._publish_mo_status(
-                    f"Orientation {orientation_idx+1} KEPT. "
-                    f"Tibia: {len(orientation_data['tibia'])} stored, "
-                    f"Femur: {len(orientation_data['femur'])} stored."
+                if bone_name not in self._last_icp_metrics:
+                    self.get_logger().warn(
+                        f"  No ICP result for {bone_name}, skipping"
+                    )
+                    continue
+
+                metrics = self._last_icp_metrics[bone_name]
+                orientation_data[bone_name].append({
+                    "T_tracker": T_tracker.copy(),
+                    "T_icp": metrics["T_icp"].copy(),
+                    "fitness": metrics["fitness"],
+                    "rmse": metrics["rmse"],
+                    "orientation_idx": orientation_idx,
+                })
+                self.get_logger().info(
+                    f"  Stored orientation {orientation_idx+1} for {bone_name} "
+                    f"(fitness={metrics['fitness']:.4f}, rmse={metrics['rmse']:.6f})"
                 )
-            else:
-                self._publish_mo_status(
-                    f"Orientation {orientation_idx+1} DISCARDED."
-                )
+
+            self._publish_mo_status(
+                f"Orientation {orientation_idx+1}: "
+                f"tibia={'KEPT' if accept_tibia else 'DISCARDED'}, "
+                f"femur={'KEPT' if accept_femur else 'DISCARDED'}. "
+                f"Tibia: {len(orientation_data['tibia'])} stored, "
+                f"Femur: {len(orientation_data['femur'])} stored."
+            )
 
             orientation_idx += 1
 
@@ -1430,6 +1434,14 @@ class DetectAndMergeNode(Node):
         with open(path, "w") as f:
             json.dump(manifest, f, indent=2)
         self.get_logger().info(f"  Manifest: {path}")
+
+    @staticmethod
+    def _resolve_ref_path(path, pkg_share):
+        """Resolve a reference PLY path: absolute, ~, or relative to pkg share."""
+        path = os.path.expanduser(path)
+        if os.path.isabs(path):
+            return path
+        return os.path.join(pkg_share, path)
 
     def _extract_joint_positions(self, msg: JointState):
         try:

@@ -359,9 +359,9 @@ class IRTrackingNode(Node):
                 f"/ee_marker_pos: {'OK' if has_istar else 'waiting'}  "
                 f"Polaris EE: {'OK' if has_polaris else 'waiting'}")
             return
-        if self._drift_m is not None:
-            self.get_logger().info(
-                f"Drift: {self._drift_m * 1000.0:.3f} mm")
+        # if self._drift_m is not None:
+        #     self.get_logger().info(
+        #         f"Drift: {self._drift_m * 1000.0:.3f} mm")
 
     # ── Cleanup ──────────────────────────────────────────────────────────
 

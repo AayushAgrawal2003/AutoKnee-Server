@@ -132,23 +132,41 @@
       "fontSize": 18
     },
 
-    "Publish!pub_keep": {
+    "Publish!pub_both": {
       "topicName": "/multi_orient/command",
       "datatype": "std_msgs/msg/String",
-      "buttonText": "KEEP Registration",
-      "buttonTooltip": "Accept this orientation's ICP result for the final least-squares solve",
+      "buttonText": "Accept Both",
+      "buttonTooltip": "Keep tibia and femur registration for this orientation",
       "buttonColor": "#27ae60",
       "advancedView": false,
-      "value": "{ \"data\": \"keep\" }"
+      "value": "{ \"data\": \"both\" }"
     },
-    "Publish!pub_discard": {
+    "Publish!pub_femur": {
       "topicName": "/multi_orient/command",
       "datatype": "std_msgs/msg/String",
-      "buttonText": "DISCARD Registration",
-      "buttonTooltip": "Reject this orientation's ICP result — it will not be used in the solve",
+      "buttonText": "Accept Femur Only",
+      "buttonTooltip": "Keep femur, discard tibia for this orientation",
+      "buttonColor": "#e67e22",
+      "advancedView": false,
+      "value": "{ \"data\": \"femur\" }"
+    },
+    "Publish!pub_tibia": {
+      "topicName": "/multi_orient/command",
+      "datatype": "std_msgs/msg/String",
+      "buttonText": "Accept Tibia Only",
+      "buttonTooltip": "Keep tibia, discard femur for this orientation",
+      "buttonColor": "#3498db",
+      "advancedView": false,
+      "value": "{ \"data\": \"tibia\" }"
+    },
+    "Publish!pub_neither": {
+      "topicName": "/multi_orient/command",
+      "datatype": "std_msgs/msg/String",
+      "buttonText": "Discard Both",
+      "buttonTooltip": "Reject both registrations for this orientation",
       "buttonColor": "#c0392b",
       "advancedView": false,
-      "value": "{ \"data\": \"discard\" }"
+      "value": "{ \"data\": \"neither\" }"
     },
     "Publish!pub_ready": {
       "topicName": "/multi_orient/command",
@@ -211,10 +229,20 @@
           "direction": "column",
           "splitPercentage": 50,
           "first": {
-            "direction": "row",
+            "direction": "column",
             "splitPercentage": 50,
-            "first": "Publish!pub_keep",
-            "second": "Publish!pub_discard"
+            "first": {
+              "direction": "row",
+              "splitPercentage": 50,
+              "first": "Publish!pub_both",
+              "second": "Publish!pub_femur"
+            },
+            "second": {
+              "direction": "row",
+              "splitPercentage": 50,
+              "first": "Publish!pub_tibia",
+              "second": "Publish!pub_neither"
+            }
           },
           "second": {
             "direction": "row",

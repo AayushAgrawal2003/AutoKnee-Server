@@ -58,6 +58,10 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
 
+    pkg_share = FindPackageShare("scan_and_merge")
+    detect_config = PathJoinSubstitution([pkg_share, "config", "detect_node.yaml"])
+    mover_config = PathJoinSubstitution([pkg_share, "config", "bone_mover.yaml"])
+
     # ── Launch Configurations ──
     cam_x = LaunchConfiguration("cam_x")
     cam_y = LaunchConfiguration("cam_y")
@@ -245,16 +249,15 @@ def generate_launch_description():
                     executable="detect_and_merge_node",
                     name="detect_and_merge_node",
                     output="screen",
-                    parameters=[{
-                        "load_waypoints": load_waypoints,
-                        "weights": weights,
-                        "target_classes": target_classes,
-                        "confidence": confidence,
-                        "velocity_scaling": velocity_scaling,
-                        "use_seg_mask": use_seg_mask,
-                        "multi_orientation": multi_orientation,
-                        "n_orientations": n_orientations,
-                    }],
+                    parameters=[
+                        detect_config,
+                        {   # CLI overrides
+                            "load_waypoints": load_waypoints,
+                            "velocity_scaling": velocity_scaling,
+                            "multi_orientation": multi_orientation,
+                            "n_orientations": n_orientations,
+                        },
+                    ],
                 ),
             ],
         ),
@@ -286,10 +289,6 @@ def generate_launch_description():
             executable="bone_cloud_mover",
             name="bone_cloud_mover",
             output="screen",
-            parameters=[{
-                "publish_rate": 20.0,
-                "ref_to_tracker_tibia": ref_to_tracker_tibia,
-                "ref_to_tracker_femur": ref_to_tracker_femur,
-            }],
+            parameters=[mover_config],
         ),
     ])
