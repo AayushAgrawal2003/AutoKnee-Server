@@ -182,11 +182,11 @@ class BoneCloudMover(Node):
         for cfg in self.BONES:
             bone = cfg['name']
             self._bones[bone] = {
-                'initial_pose': None,
                 'current_pose': None,
-                'clouds': {},          # input_topic -> {points, colors}
+                # Per-cloud-topic tracking: each locks independently
+                # topic -> {points, colors, initial_pose, locked}
+                'cloud_slots': {},
                 'publishers': {},      # input_topic -> Publisher
-                'locked': False,
             }
 
             # Pose subscriber (volatile — live stream)
@@ -196,6 +196,12 @@ class BoneCloudMover(Node):
 
             # Cloud subscribers (transient_local — latched from detect node)
             for in_topic, out_topic in zip(cfg['cloud_topics'], cfg['out_topics']):
+                self._bones[bone]['cloud_slots'][in_topic] = {
+                    'points': None,
+                    'colors': None,
+                    'initial_pose': None,
+                    'locked': False,
+                }
                 self.create_subscription(
                     PointCloud2, in_topic,
                     lambda msg, b=bone, t=in_topic: self._cloud_cb(msg, b, t),
@@ -214,33 +220,39 @@ class BoneCloudMover(Node):
         b = self._bones[bone]
         T = _pose_msg_to_matrix(msg)
         b['current_pose'] = T
-        self._try_lock(bone)
+        # Lock any cloud slots that have data but were waiting for a pose
+        for topic, slot in b['cloud_slots'].items():
+            if not slot['locked'] and slot['points'] is not None:
+                self._try_lock(bone, topic)
 
     def _cloud_cb(self, msg, bone, topic):
         b = self._bones[bone]
-        if b['locked']:
+        slot = b['cloud_slots'][topic]
+
+        # Allow re-receiving a cloud even after lock (e.g. republish)
+        if slot['locked']:
             return
 
         points, colors = _pc2_to_numpy(msg)
         if len(points) == 0:
             return
 
-        b['clouds'][topic] = {'points': points, 'colors': colors}
+        slot['points'] = points
+        slot['colors'] = colors
         self.get_logger().info(f'[{bone}] Received {topic} ({len(points)} pts)')
-        self._try_lock(bone)
+        self._try_lock(bone, topic)
 
-    def _try_lock(self, bone):
-        """Lock when we have pose + at least one cloud."""
+    def _try_lock(self, bone, topic):
+        """Lock a single cloud slot when we have its data + a pose."""
         b = self._bones[bone]
-        if b['locked'] or not b['clouds'] or b['current_pose'] is None:
+        slot = b['cloud_slots'][topic]
+        if slot['locked'] or slot['points'] is None or b['current_pose'] is None:
             return
-        b['initial_pose'] = b['current_pose'].copy()
-        b['locked'] = True
-        n_clouds = len(b['clouds'])
-        total_pts = sum(len(c['points']) for c in b['clouds'].values())
+        slot['initial_pose'] = b['current_pose'].copy()
+        slot['locked'] = True
         self.get_logger().info(
-            f'[{bone}] LOCKED — {n_clouds} cloud(s), '
-            f'{total_pts} total pts, tracking active')
+            f'[{bone}] LOCKED {topic} — {len(slot["points"])} pts, '
+            f'tracking active')
 
     # ── Publish loop ──────────────────────────────────────────────────────
 
@@ -248,14 +260,16 @@ class BoneCloudMover(Node):
         stamp = self.get_clock().now().to_msg()
 
         for bone_name, b in self._bones.items():
-            if not b['locked'] or b['current_pose'] is None:
+            if b['current_pose'] is None:
                 continue
 
-            T_delta = b['current_pose'] @ _invert_transform(b['initial_pose'])
+            for topic, slot in b['cloud_slots'].items():
+                if not slot['locked']:
+                    continue
 
-            for topic, cloud_data in b['clouds'].items():
-                pts = cloud_data['points']
-                cols = cloud_data['colors']
+                T_delta = b['current_pose'] @ _invert_transform(slot['initial_pose'])
+                pts = slot['points']
+                cols = slot['colors']
 
                 pts_transformed = (T_delta[:3, :3] @ pts.T).T + T_delta[:3, 3]
 
