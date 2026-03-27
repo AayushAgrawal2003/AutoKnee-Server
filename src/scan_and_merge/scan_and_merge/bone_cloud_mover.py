@@ -1,32 +1,25 @@
 #!/usr/bin/env python3
 """
-Bone Cloud Mover — rigid-body tracking of aligned point clouds.
+Bone Cloud Mover — tracks reference point clouds with IR markers.
 
-After ICP alignment, the detect_and_merge_node publishes bone point clouds
-once (with transient_local durability) in lbr_link_0 frame. This node
-subscribes to those clouds AND to the live bone-tracker poses from the IR
-tracking system. Once both are available for a bone, it locks the initial
-tracker pose and continuously re-publishes the clouds transformed by the
-tracker's relative motion.
+Two modes of operation:
 
-The result: scanned/reference point clouds move in real time with the
-physical bone as tracked by the Polaris Vega IR camera.
+1. BEFORE calibration (anchor+delta):
+   Receives ICP-aligned clouds on /registered/* and /reference/*,
+   locks the tracker pose at reception time, and publishes clouds
+   transformed by the tracker's relative motion.
 
-Subscriptions:
-    /kuka_frame/bone_pose_femur   PoseStamped   Live femur tracker pose
-    /kuka_frame/bone_pose_tibia   PoseStamped   Live tibia tracker pose
-    /registered/femur             PointCloud2   ICP-aligned femur scan  (latched)
-    /registered/tibia             PointCloud2   ICP-aligned tibia scan  (latched)
-    /reference/femur              PointCloud2   Reference femur model   (latched)
-    /reference/tibia              PointCloud2   Reference tibia model   (latched)
+2. AFTER calibration (direct):
+   Receives T_ref_to_tracker (4x4) and model-frame reference points.
+   Publishes only /tracked/reference/{bone} = T_tracker @ T_ref_to_tracker
+   applied to model-frame points. All other outputs stop.
 
-Publications:
-    /tracked/registered/femur     PointCloud2   Femur scan following tracker
-    /tracked/registered/tibia     PointCloud2   Tibia scan following tracker
-    /tracked/reference/femur      PointCloud2   Reference femur following tracker
-    /tracked/reference/tibia      PointCloud2   Reference tibia following tracker
+Publications (final output):
+    /tracked/reference/femur   PointCloud2   Reference femur in base frame
+    /tracked/reference/tibia   PointCloud2   Reference tibia in base frame
 """
 
+import os
 import numpy as np
 
 import rclpy
@@ -34,102 +27,77 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import PointCloud2, PointField
-from std_msgs.msg import Header
+from std_msgs.msg import Header, Float64MultiArray
 
 
 FRAME_ID = 'lbr_link_0'
 
 
 # ---------------------------------------------------------------------------
-# Math helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
-def _pose_msg_to_matrix(msg):
-    """PoseStamped -> 4x4 homogeneous transform."""
+def _pose_to_matrix(msg):
     p = msg.pose
     x, y, z, w = p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w
-    n = np.sqrt(x * x + y * y + z * z + w * w)
+    n = np.sqrt(x*x + y*y + z*z + w*w)
     if n < 1e-12:
         return np.eye(4)
-    x, y, z, w = x / n, y / n, z / n, w / n
-    xx, yy, zz = x * x, y * y, z * z
-    xy, xz, yz = x * y, x * z, y * z
-    wx, wy, wz = w * x, w * y, w * z
+    x, y, z, w = x/n, y/n, z/n, w/n
     T = np.eye(4)
     T[:3, :3] = np.array([
-        [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz),       2.0 * (xz + wy)],
-        [2.0 * (xy + wz),       1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
-        [2.0 * (xz - wy),       2.0 * (yz + wx),       1.0 - 2.0 * (xx + yy)],
+        [1 - 2*(y*y+z*z), 2*(x*y-w*z),     2*(x*z+w*y)],
+        [2*(x*y+w*z),     1 - 2*(x*x+z*z), 2*(y*z-w*x)],
+        [2*(x*z-w*y),     2*(y*z+w*x),     1 - 2*(x*x+y*y)],
     ])
-    T[0, 3] = p.position.x
-    T[1, 3] = p.position.y
-    T[2, 3] = p.position.z
+    T[0, 3], T[1, 3], T[2, 3] = p.position.x, p.position.y, p.position.z
     return T
 
 
-def _invert_transform(T):
-    """SE(3) inverse via R^T."""
-    R = T[:3, :3]
-    t = T[:3, 3]
+def _invert_T(T):
+    R, t = T[:3, :3], T[:3, 3]
     Ti = np.eye(4)
     Ti[:3, :3] = R.T
     Ti[:3, 3] = -R.T @ t
     return Ti
 
 
-# ---------------------------------------------------------------------------
-# PointCloud2 conversion
-# ---------------------------------------------------------------------------
-
 def _pc2_to_numpy(msg):
-    """Parse XYZRGB PointCloud2 -> (N,3) float32 points, (N,3) uint8 colors."""
     n = msg.width * msg.height
     if n == 0:
-        return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.uint8)
-
-    point_step = msg.point_step
-    raw = np.frombuffer(msg.data, dtype=np.uint8).reshape(n, point_step)
-
-    points = np.frombuffer(raw[:, 0:12].tobytes(), dtype=np.float32).reshape(n, 3).copy()
-
-    if point_step >= 16:
-        rgb_uint32 = np.frombuffer(raw[:, 12:16].tobytes(), dtype=np.uint32).reshape(n)
-        r = ((rgb_uint32 >> 16) & 0xFF).astype(np.uint8)
-        g = ((rgb_uint32 >> 8) & 0xFF).astype(np.uint8)
-        b = (rgb_uint32 & 0xFF).astype(np.uint8)
-        colors = np.column_stack([r, g, b])
+        return np.empty((0, 3), np.float32), np.empty((0, 3), np.uint8)
+    ps = msg.point_step
+    raw = np.frombuffer(msg.data, np.uint8).reshape(n, ps)
+    pts = np.frombuffer(raw[:, 0:12].tobytes(), np.float32).reshape(n, 3).copy()
+    if ps >= 16:
+        rgb = np.frombuffer(raw[:, 12:16].tobytes(), np.uint32).reshape(n)
+        cols = np.column_stack([
+            ((rgb >> 16) & 0xFF).astype(np.uint8),
+            ((rgb >> 8) & 0xFF).astype(np.uint8),
+            (rgb & 0xFF).astype(np.uint8),
+        ])
     else:
-        colors = np.full((n, 3), 200, dtype=np.uint8)
-
-    return points, colors
+        cols = np.full((n, 3), 200, np.uint8)
+    return pts, cols
 
 
 def _numpy_to_pc2(points, colors, frame_id, stamp):
-    """Build XYZRGB PointCloud2 from numpy arrays."""
     n = len(points)
     msg = PointCloud2()
-    msg.header = Header()
-    msg.header.frame_id = frame_id
-    msg.header.stamp = stamp
+    msg.header = Header(frame_id=frame_id, stamp=stamp)
     msg.height = 1
     msg.width = n
-
     if n == 0:
         return msg
-
     pts = points.astype(np.float32)
-
     if colors is not None and len(colors) == n:
-        cols = colors.astype(np.uint8)
-        rgb_uint32 = (cols[:, 0].astype(np.uint32) << 16 |
-                      cols[:, 1].astype(np.uint32) << 8 |
-                      cols[:, 2].astype(np.uint32))
+        c = colors.astype(np.uint8)
+        rgb = (c[:, 0].astype(np.uint32) << 16 |
+               c[:, 1].astype(np.uint32) << 8 |
+               c[:, 2].astype(np.uint32))
     else:
-        rgb_uint32 = np.full(n, (200 << 16) | (200 << 8) | 200, dtype=np.uint32)
-
-    rgb_float = rgb_uint32.view(np.float32)
-    data = np.column_stack([pts, rgb_float.reshape(-1, 1)])
-
+        rgb = np.full(n, 0xC8C8C8, np.uint32)
+    data = np.column_stack([pts, rgb.view(np.float32).reshape(-1, 1)])
     msg.fields = [
         PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
         PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
@@ -150,28 +118,19 @@ def _numpy_to_pc2(points, colors, frame_id, stamp):
 
 class BoneCloudMover(Node):
 
-    BONES = [
-        {
-            'name': 'femur',
-            'pose_topic': '/kuka_frame/bone_pose_femur',
-            'cloud_topics': ['/registered/femur', '/reference/femur'],
-            'out_topics': ['/tracked/registered/femur', '/tracked/reference/femur'],
-        },
-        {
-            'name': 'tibia',
-            'pose_topic': '/kuka_frame/bone_pose_tibia',
-            'cloud_topics': ['/registered/tibia', '/reference/tibia'],
-            'out_topics': ['/tracked/registered/tibia', '/tracked/reference/tibia'],
-        },
-    ]
+    BONES = {
+        'femur': '/kuka_frame/bone_pose_femur',
+        'tibia': '/kuka_frame/bone_pose_tibia',
+    }
 
     def __init__(self):
         super().__init__('bone_cloud_mover')
 
         self.declare_parameter('publish_rate', 20.0)
-        rate = self.get_parameter('publish_rate').value
+        self.declare_parameter('ref_to_tracker_tibia', '')
+        self.declare_parameter('ref_to_tracker_femur', '')
 
-        self._bones = {}
+        rate = self.get_parameter('publish_rate').value
 
         latch_qos = QoSProfile(
             depth=1,
@@ -179,108 +138,119 @@ class BoneCloudMover(Node):
             reliability=ReliabilityPolicy.RELIABLE,
         )
 
-        for cfg in self.BONES:
-            bone = cfg['name']
-            self._bones[bone] = {
-                'current_pose': None,
-                # Per-cloud-topic tracking: each locks independently
-                # topic -> {points, colors, initial_pose, locked}
-                'cloud_slots': {},
-                'publishers': {},      # input_topic -> Publisher
-            }
+        # Per-bone state
+        self._tracker_pose = {}      # bone -> 4x4 (live)
+        self._calibration = {}       # bone -> 4x4 T_ref_to_tracker
+        self._model_pts = {}         # bone -> (pts, cols) in model frame
+        self._anchor_clouds = {}     # bone -> {pts, cols, initial_pose}  (pre-cal fallback)
 
-            # Pose subscriber (volatile — live stream)
+        # Output publishers — the only 2 topics that matter
+        self._pub = {}
+        for bone in self.BONES:
+            self._pub[bone] = self.create_publisher(
+                PointCloud2, f'/tracked/reference/{bone}', 10)
+
+        # Load calibrations from file if provided at launch
+        for bone in self.BONES:
+            path = self.get_parameter(f'ref_to_tracker_{bone}').value
+            if path:
+                path = os.path.expanduser(path)
+                if os.path.exists(path):
+                    self._calibration[bone] = np.load(path)
+                    self.get_logger().info(f'[{bone}] Loaded calibration from {path}')
+
+        # ── Subscriptions ──
+
+        # Live tracker poses
+        for bone, topic in self.BONES.items():
             self.create_subscription(
-                PoseStamped, cfg['pose_topic'],
+                PoseStamped, topic,
                 lambda msg, b=bone: self._pose_cb(msg, b), 10)
 
-            # Cloud subscribers (transient_local — latched from detect node)
-            for in_topic, out_topic in zip(cfg['cloud_topics'], cfg['out_topics']):
-                self._bones[bone]['cloud_slots'][in_topic] = {
-                    'points': None,
-                    'colors': None,
-                    'initial_pose': None,
-                    'locked': False,
-                }
-                self.create_subscription(
-                    PointCloud2, in_topic,
-                    lambda msg, b=bone, t=in_topic: self._cloud_cb(msg, b, t),
-                    latch_qos)
-                self._bones[bone]['publishers'][in_topic] = \
-                    self.create_publisher(PointCloud2, out_topic, 10)
+        # Live calibration updates (from solver)
+        for bone in self.BONES:
+            self.create_subscription(
+                Float64MultiArray, f'/calibration/ref_to_tracker_{bone}',
+                lambda msg, b=bone: self._cal_cb(msg, b), 10)
+
+        # Model-frame reference clouds (from solver)
+        for bone in self.BONES:
+            self.create_subscription(
+                PointCloud2, f'/reference_model/{bone}',
+                lambda msg, b=bone: self._model_cb(msg, b), latch_qos)
+
+        # Pre-calibration fallback: ICP-aligned reference clouds
+        for bone in self.BONES:
+            self.create_subscription(
+                PointCloud2, f'/reference/{bone}',
+                lambda msg, b=bone: self._ref_cloud_cb(msg, b), latch_qos)
 
         self.create_timer(1.0 / rate, self._publish_loop)
         self.get_logger().info(
-            f'Bone Cloud Mover running at {rate:.0f} Hz. '
-            f'Waiting for tracker poses and aligned point clouds...')
+            f'Bone Cloud Mover running at {rate:.0f} Hz — '
+            f'waiting for tracker + calibration data...')
 
-    # ── Callbacks ─────────────────────────────────────────────────────────
+    # ── Callbacks ─────────────────────────────────────────────────────
 
     def _pose_cb(self, msg, bone):
-        b = self._bones[bone]
-        T = _pose_msg_to_matrix(msg)
-        b['current_pose'] = T
-        # Lock any cloud slots that have data but were waiting for a pose
-        for topic, slot in b['cloud_slots'].items():
-            if not slot['locked'] and slot['points'] is not None:
-                self._try_lock(bone, topic)
+        self._tracker_pose[bone] = _pose_to_matrix(msg)
 
-    def _cloud_cb(self, msg, bone, topic):
-        b = self._bones[bone]
-        slot = b['cloud_slots'][topic]
-
-        # Allow re-receiving a cloud even after lock (e.g. republish)
-        if slot['locked']:
+    def _cal_cb(self, msg, bone):
+        if len(msg.data) != 16:
             return
+        self._calibration[bone] = np.array(msg.data).reshape(4, 4)
+        self.get_logger().info(f'[{bone}] Calibration received — direct tracking active')
 
-        points, colors = _pc2_to_numpy(msg)
-        if len(points) == 0:
+    def _model_cb(self, msg, bone):
+        pts, cols = _pc2_to_numpy(msg)
+        if len(pts) > 0:
+            self._model_pts[bone] = (pts, cols)
+            self.get_logger().info(f'[{bone}] Model reference received ({len(pts)} pts)')
+
+    def _ref_cloud_cb(self, msg, bone):
+        """Pre-calibration fallback: store ICP-aligned base-frame cloud."""
+        if bone in self._calibration:
+            return  # already calibrated, ignore
+        pts, cols = _pc2_to_numpy(msg)
+        if len(pts) == 0:
             return
-
-        slot['points'] = points
-        slot['colors'] = colors
-        self.get_logger().info(f'[{bone}] Received {topic} ({len(points)} pts)')
-        self._try_lock(bone, topic)
-
-    def _try_lock(self, bone, topic):
-        """Lock a single cloud slot when we have its data + a pose."""
-        b = self._bones[bone]
-        slot = b['cloud_slots'][topic]
-        if slot['locked'] or slot['points'] is None or b['current_pose'] is None:
+        T = self._tracker_pose.get(bone)
+        if T is None:
             return
-        slot['initial_pose'] = b['current_pose'].copy()
-        slot['locked'] = True
-        self.get_logger().info(
-            f'[{bone}] LOCKED {topic} — {len(slot["points"])} pts, '
-            f'tracking active')
+        self._anchor_clouds[bone] = {
+            'pts': pts, 'cols': cols, 'initial_pose': T.copy(),
+        }
+        self.get_logger().info(f'[{bone}] Anchor cloud locked ({len(pts)} pts)')
 
-    # ── Publish loop ──────────────────────────────────────────────────────
+    # ── Publish loop ──────────────────────────────────────────────────
 
     def _publish_loop(self):
         stamp = self.get_clock().now().to_msg()
 
-        for bone_name, b in self._bones.items():
-            if b['current_pose'] is None:
+        for bone in self.BONES:
+            T_tracker = self._tracker_pose.get(bone)
+            if T_tracker is None:
                 continue
 
-            for topic, slot in b['cloud_slots'].items():
-                if not slot['locked']:
-                    continue
+            # MODE 1: Calibrated — model pts × (T_tracker @ T_ref_to_tracker)
+            if bone in self._calibration and bone in self._model_pts:
+                pts, cols = self._model_pts[bone]
+                T = T_tracker @ self._calibration[bone]
+                out = (T[:3, :3] @ pts.T).T + T[:3, 3]
+                self._pub[bone].publish(
+                    _numpy_to_pc2(out, cols, FRAME_ID, stamp))
+                continue
 
-                T_delta = b['current_pose'] @ _invert_transform(slot['initial_pose'])
-                pts = slot['points']
-                cols = slot['colors']
-
-                pts_transformed = (T_delta[:3, :3] @ pts.T).T + T_delta[:3, 3]
-
-                msg = _numpy_to_pc2(pts_transformed, cols, FRAME_ID, stamp)
-                b['publishers'][topic].publish(msg)
+            # MODE 2: Pre-calibration fallback — anchor + delta
+            anchor = self._anchor_clouds.get(bone)
+            if anchor is not None:
+                T_delta = T_tracker @ _invert_T(anchor['initial_pose'])
+                out = (T_delta[:3, :3] @ anchor['pts'].T).T + T_delta[:3, 3]
+                self._pub[bone].publish(
+                    _numpy_to_pc2(out, anchor['cols'], FRAME_ID, stamp))
 
 
 # ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
 def main(args=None):
     rclpy.init(args=args)
     node = BoneCloudMover()
@@ -290,7 +260,6 @@ def main(args=None):
         pass
     node.destroy_node()
     rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()

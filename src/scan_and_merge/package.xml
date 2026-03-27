@@ -13,6 +13,9 @@
   <exec_depend>moveit_msgs</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
   <exec_depend>tf2_sensor_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>interactive_markers</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
   <exec_depend>realsense2_camera</exec_depend>
   <exec_depend>lbr_description</exec_depend>
 

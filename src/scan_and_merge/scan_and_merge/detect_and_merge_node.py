@@ -40,7 +40,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 
 from sensor_msgs.msg import JointState, Image, CameraInfo, PointCloud2, PointField
-from std_msgs.msg import Header
+from std_msgs.msg import Header, String, Float64MultiArray
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import (
     MotionPlanRequest,
@@ -78,6 +78,11 @@ except ImportError:
 
 from scan_and_merge.cloud_denoise import denoise_per_bone_pipeline
 from scan_and_merge.icp_registration import register_bone
+from scan_and_merge.multi_orientation_solver import solve_with_outlier_rejection
+from scan_and_merge.mo_utils import (
+    quat_to_rotation_matrix, numpy_to_pc2,
+    parse_target_classes, MultiOrientHelper,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -160,6 +165,11 @@ class DetectAndMergeNode(Node):
         self.declare_parameter("tibia_init_transform", "~/detect_output/tibia_icp_T_ref2base_20260227_202247.npy")  # path to .npy 4x4
         self.declare_parameter("femur_init_transform", "~/detect_output/femur_icp_T_ref2base_20260227_202247.npy")  # path to .npy 4x4
 
+        # Multi-orientation calibration params
+        self.declare_parameter("multi_orientation", False)
+        self.declare_parameter("n_orientations", 3)
+        self.declare_parameter("tracker_avg_samples", 50)
+
         self.cb_group = ReentrantCallbackGroup()
 
         # ── State ──
@@ -197,6 +207,10 @@ class DetectAndMergeNode(Node):
             callback_group=self.cb_group,
         )
 
+        # ── Multi-orientation helper (own node + executor — commands + bone poses) ──
+        self._mo_helper = MultiOrientHelper()
+        self._mo_status_pub = self.create_publisher(String, "/multi_orient/status", 10)
+
         # ── MoveIt2 ──
         self.move_group_client = ActionClient(
             self, MoveGroup, "/lbr/move_action",
@@ -216,6 +230,17 @@ class DetectAndMergeNode(Node):
 
         # Messages to latch-publish (set after registration)
         self._registered_msgs = {}  # populated after ICP
+        self._last_icp_metrics = {}  # bone_name -> {fitness, rmse, T_icp}
+
+        # Calibration publishers (send T_ref_to_tracker to bone_cloud_mover live)
+        self._cal_pub_tibia = self.create_publisher(
+            Float64MultiArray, "/calibration/ref_to_tracker_tibia", 10)
+        self._cal_pub_femur = self.create_publisher(
+            Float64MultiArray, "/calibration/ref_to_tracker_femur", 10)
+
+        # Model-frame reference cloud publishers (for bone_cloud_mover calibrated tracking)
+        self.pub_tibia_ref_model = self.create_publisher(PointCloud2, "/reference_model/tibia", latch_qos)
+        self.pub_femur_ref_model = self.create_publisher(PointCloud2, "/reference_model/femur", latch_qos)
 
         # ── Output dirs ──
         self.det_dir = os.path.join(OUTPUT_DIR, "detections")
@@ -245,6 +270,26 @@ class DetectAndMergeNode(Node):
 
     def _caminfo_cb(self, msg: CameraInfo):
         self.latest_camera_info = msg
+
+    def _publish_mo_status(self, text):
+        msg = String()
+        msg.data = text
+        self._mo_status_pub.publish(msg)
+        self.get_logger().info(f"  [multi_orient] {text}")
+
+    def _avg_bone_pose(self, bone, n_samples=50, timeout=5.0):
+        """Average the last n_samples tracker poses for a bone."""
+        T = self._mo_helper.avg_pose(bone, n_samples, timeout)
+        if T is None:
+            self.get_logger().warn(f"  No tracker poses for {bone}")
+        return T
+
+    def _wait_for_mo_command(self, valid_commands, prompt_msg):
+        """Block until a valid command arrives on /multi_orient/command."""
+        self._publish_mo_status(prompt_msg)
+        cmd = self._mo_helper.wait_command(*valid_commands)
+        self.get_logger().info(f"  [multi_orient] Got command: '{cmd}'")
+        return cmd
 
     # ──────────────────────────────────────────────────────────────────
     # Main Workflow
@@ -307,8 +352,13 @@ class DetectAndMergeNode(Node):
             self.get_parameter("femur_init_transform").get_parameter_value().string_value
         )
 
+        # Multi-orientation params
+        self.multi_orientation = self.get_parameter("multi_orientation").get_parameter_value().bool_value
+        self.n_orientations = self.get_parameter("n_orientations").get_parameter_value().integer_value
+        self.tracker_avg_samples = self.get_parameter("tracker_avg_samples").get_parameter_value().integer_value
+
         # ── Parse target classes ──
-        self.target_classes = self._parse_target_classes(target_cls_str)
+        self.target_classes = parse_target_classes(target_cls_str)
         if self.target_classes:
             self.get_logger().info(f"  Filtering classes: {self.target_classes}")
         else:
@@ -360,6 +410,16 @@ class DetectAndMergeNode(Node):
         )
 
         # ── Execute ──
+        if self.multi_orientation:
+            self._run_multi_orientation_workflow(waypoints, velocity, weights_path)
+        else:
+            self._run_single_orientation_workflow(waypoints, velocity, weights_path)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Single-Orientation Workflow (original behavior)
+    # ──────────────────────────────────────────────────────────────────
+    def _run_single_orientation_workflow(self, waypoints, velocity, weights_path):
+        """Original pipeline: scan -> merge -> denoise -> register -> publish."""
         self.get_logger().info(
             f"\n{'='*60}\n"
             f"  PHASE: DETECT & CAPTURE\n"
@@ -382,13 +442,9 @@ class DetectAndMergeNode(Node):
             )
             time.sleep(self.settle_time)
 
-            # Capture TF while stationary
             rot, trans = self._capture_current_transform()
-
-            # Capture + detect + filter
             self._detect_and_capture(i, rot, trans)
 
-        # ── Merge ──
         if self.waypoint_clouds:
             self.get_logger().info(
                 f"\n{'='*60}\n"
@@ -401,7 +457,6 @@ class DetectAndMergeNode(Node):
 
         self._save_manifest(waypoints, weights_path)
 
-        # ── Phase 4: ICP Registration ──
         if self.do_register and self.denoise_results:
             self._run_registration()
 
@@ -412,13 +467,321 @@ class DetectAndMergeNode(Node):
             f"{'='*60}"
         )
 
-        # ── Publish registered clouds once (transient_local for bone_cloud_mover) ──
         if self._registered_msgs:
             self._publish_registered()
             self.get_logger().info(
                 "  Published registered clouds (transient_local, one-shot). "
                 "bone_cloud_mover will handle live tracking."
             )
+
+    # ──────────────────────────────────────────────────────────────────
+    # Multi-Orientation Workflow
+    # ──────────────────────────────────────────────────────────────────
+    def _run_multi_orientation_workflow(self, waypoints, velocity, weights_path):
+        """
+        Multi-orientation calibration workflow.
+
+        For each orientation:
+          1. Run full scan -> YOLO -> merge -> denoise -> ICP pipeline
+          2. Ask user to keep/discard the registration result
+          3. If kept, store (T_icp, T_tracker, fitness, rmse) per bone
+          4. Wait for user to signal "ready" (bones repositioned)
+        After all orientations or user says "solve":
+          5. Run least-squares solver per bone
+          6. Save calibration files
+          7. Publish calibrated reference clouds
+
+        User commands via /multi_orient/command topic:
+          "keep"    — accept current registration for least-squares
+          "discard" — reject current registration, re-try or skip
+          "ready"   — bones have been moved to next position, start next scan
+          "solve"   — skip remaining orientations and run least-squares now
+        """
+        bone_ref_map = {
+            "bone_left":  "tibia",
+            "bone_right": "femur",
+        }
+
+        # Per-bone orientation data collectors
+        orientation_data = {
+            "tibia": [],
+            "femur": [],
+        }
+
+        self._publish_mo_status(
+            f"MULTI-ORIENTATION MODE: {self.n_orientations} orientations planned. "
+            f"Commands: publish to /multi_orient/command"
+        )
+
+        orientation_idx = 0
+        done = False
+
+        while orientation_idx < self.n_orientations and not done:
+            self._publish_mo_status(
+                f"=== ORIENTATION {orientation_idx+1}/{self.n_orientations} ==="
+            )
+
+            # ── Clear state for this orientation ──
+            self.waypoint_clouds = []
+            self.denoise_results = {}
+            self._registered_msgs = {}
+
+            # ── Capture tracker poses BEFORE scanning (average over N frames) ──
+            self.get_logger().info("  Averaging tracker poses...")
+            T_tracker_tibia = self._avg_bone_pose("tibia", self.tracker_avg_samples)
+            T_tracker_femur = self._avg_bone_pose("femur", self.tracker_avg_samples)
+
+            if T_tracker_tibia is not None:
+                self.get_logger().info(
+                    f"  Tibia tracker: t=[{T_tracker_tibia[0,3]:.4f}, "
+                    f"{T_tracker_tibia[1,3]:.4f}, {T_tracker_tibia[2,3]:.4f}]"
+                )
+            if T_tracker_femur is not None:
+                self.get_logger().info(
+                    f"  Femur tracker: t=[{T_tracker_femur[0,3]:.4f}, "
+                    f"{T_tracker_femur[1,3]:.4f}, {T_tracker_femur[2,3]:.4f}]"
+                )
+
+            # ── Run the full scan+detect+merge+denoise+ICP pipeline ──
+            self.get_logger().info(
+                f"\n{'='*60}\n"
+                f"  PHASE: DETECT & CAPTURE (orientation {orientation_idx+1})\n"
+                f"  {len(waypoints)} waypoints, velocity={velocity}\n"
+                f"{'='*60}"
+            )
+
+            for i, target_joints in enumerate(waypoints):
+                self.get_logger().info(f"\n  -- Waypoint {i+1}/{len(waypoints)} --")
+
+                success = self._move_to_joint_target(target_joints, velocity)
+                if not success:
+                    self.get_logger().warn(f"  Failed WP {i+1}, skipping.")
+                    continue
+
+                self.get_logger().info(f"  Settling {self.settle_time:.1f}s...")
+                time.sleep(self.settle_time)
+
+                rot, trans = self._capture_current_transform()
+                self._detect_and_capture(i, rot, trans)
+
+            # ── Merge + denoise ──
+            if self.waypoint_clouds:
+                self.get_logger().info(
+                    f"\n{'='*60}\n"
+                    f"  MERGE ({len(self.waypoint_clouds)} instance clouds)\n"
+                    f"{'='*60}"
+                )
+                self._merge_clouds()
+            else:
+                self.get_logger().warn("No clouds to merge for this orientation!")
+
+            # ── ICP Registration ──
+            icp_results = {}
+            if self.do_register and self.denoise_results:
+                self._run_registration()
+                icp_results = dict(self._registered_msgs)
+
+            # ── Publish so user can see result in RViz ──
+            if self._registered_msgs:
+                self._publish_registered()
+
+            # ── Ask user: keep or discard? ──
+            cmd = self._wait_for_mo_command(
+                ["keep", "discard"],
+                f"Orientation {orientation_idx+1} done. "
+                f"Publish 'keep' or 'discard' to /multi_orient/command"
+            )
+
+            if cmd == "keep":
+                # Store the ICP results + tracker poses for the solver
+                bone_tracker_map = {
+                    "tibia": T_tracker_tibia,
+                    "femur": T_tracker_femur,
+                }
+
+                for bone_name in ["tibia", "femur"]:
+                    T_tracker = bone_tracker_map.get(bone_name)
+                    if T_tracker is None:
+                        self.get_logger().warn(
+                            f"  No tracker pose for {bone_name}, skipping"
+                        )
+                        continue
+
+                    if bone_name not in self._last_icp_metrics:
+                        self.get_logger().warn(
+                            f"  No ICP result for {bone_name}, skipping"
+                        )
+                        continue
+
+                    metrics = self._last_icp_metrics[bone_name]
+                    orientation_data[bone_name].append({
+                        "T_tracker": T_tracker.copy(),
+                        "T_icp": metrics["T_icp"].copy(),
+                        "fitness": metrics["fitness"],
+                        "rmse": metrics["rmse"],
+                        "orientation_idx": orientation_idx,
+                    })
+                    self.get_logger().info(
+                        f"  Stored orientation {orientation_idx+1} for {bone_name} "
+                        f"(fitness={metrics['fitness']:.4f}, rmse={metrics['rmse']:.6f})"
+                    )
+
+                self._publish_mo_status(
+                    f"Orientation {orientation_idx+1} KEPT. "
+                    f"Tibia: {len(orientation_data['tibia'])} stored, "
+                    f"Femur: {len(orientation_data['femur'])} stored."
+                )
+            else:
+                self._publish_mo_status(
+                    f"Orientation {orientation_idx+1} DISCARDED."
+                )
+
+            orientation_idx += 1
+
+            # ── If not last orientation, wait for user to reposition bones ──
+            if orientation_idx < self.n_orientations:
+                cmd = self._wait_for_mo_command(
+                    ["ready", "solve"],
+                    f"Reposition bones, then publish 'ready'. "
+                    f"Or publish 'solve' to finish early."
+                )
+                if cmd == "solve":
+                    self._publish_mo_status("Early solve requested.")
+                    done = True
+
+                # Clear pose buffer so we get fresh poses for next orientation
+                self._mo_helper.clear_poses()
+
+        # ── Run the least-squares solver ──
+        self._run_multi_orient_solve(orientation_data)
+
+    def _run_multi_orient_solve(self, orientation_data):
+        """Run the least-squares solver and save results."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        frame_id = BASE_FRAME
+        report = {}
+
+        for bone_name in ["tibia", "femur"]:
+            oris = orientation_data[bone_name]
+
+            if len(oris) < 1:
+                self.get_logger().warn(
+                    f"  No orientation data for {bone_name}, skipping solve"
+                )
+                continue
+
+            self._publish_mo_status(
+                f"Solving {bone_name} with {len(oris)} orientations..."
+            )
+
+            try:
+                result = solve_with_outlier_rejection(oris)
+            except Exception as e:
+                self.get_logger().error(f"  Solver failed for {bone_name}: {e}")
+                continue
+
+            T_ref_to_tracker = result["T_ref_to_tracker"]
+            val = result["validation"]
+
+            self.get_logger().info(
+                f"\n{'='*60}\n"
+                f"  {bone_name.upper()} MULTI-ORIENT RESULT\n"
+                f"  Orientations used: {result['n_orientations_used']}/{len(oris)}\n"
+                f"  Rejected: {result['rejected_indices']}\n"
+                f"  Mean translation residual: {val['mean_trans_mm']:.2f} mm\n"
+                f"  Mean rotation residual: {val['mean_rot_deg']:.2f} deg\n"
+                f"{'='*60}"
+            )
+
+            for i, r in enumerate(val["residuals"]):
+                flag = " ** OUTLIER" if i in [
+                    ri for ri in result["rejected_indices"]
+                ] else ""
+                self.get_logger().info(
+                    f"    Orientation {i+1}: "
+                    f"trans={r['trans_mm']:.2f}mm, rot={r['rot_deg']:.2f}deg{flag}"
+                )
+
+            # Save calibration
+            cal_path = os.path.join(
+                OUTPUT_DIR, f"T_ref_to_tracker_{bone_name}_{timestamp}.npy"
+            )
+            np.save(cal_path, T_ref_to_tracker)
+            self.get_logger().info(f"  Saved calibration: {cal_path}")
+
+            # Publish calibration to bone_cloud_mover for immediate use
+            cal_msg = Float64MultiArray()
+            cal_msg.data = T_ref_to_tracker.flatten().tolist()
+            if bone_name == "tibia":
+                self._cal_pub_tibia.publish(cal_msg)
+            else:
+                self._cal_pub_femur.publish(cal_msg)
+            self.get_logger().info(
+                f"  Published live calibration for {bone_name} to bone_cloud_mover"
+            )
+
+            # Save orientation data
+            ori_path = os.path.join(
+                OUTPUT_DIR, f"multi_orient_{bone_name}_{timestamp}.npy"
+            )
+            np.save(ori_path, oris, allow_pickle=True)
+
+            report[bone_name] = {
+                "n_orientations": len(oris),
+                "n_used": result["n_orientations_used"],
+                "rejected": result["rejected_indices"],
+                "mean_trans_mm": val["mean_trans_mm"],
+                "mean_rot_deg": val["mean_rot_deg"],
+                "residuals": val["residuals"],
+                "calibration_file": cal_path,
+            }
+
+            # Publish model-frame reference points for bone_cloud_mover
+            ref_path = self.tibia_ref_path if bone_name == "tibia" else self.femur_ref_path
+            if ref_path and os.path.exists(ref_path):
+                try:
+                    from scan_and_merge.icp_registration import load_reference_mesh
+                    ref_pcd = load_reference_mesh(ref_path, voxel_size=self.icp_voxel)
+                    ref_pts = np.asarray(ref_pcd.points)
+                    ref_cols = np.asarray(ref_pcd.colors) if ref_pcd.has_colors() else None
+
+                    # Publish model-frame points (bone_cloud_mover applies T_tracker @ T_cal)
+                    model_msg = numpy_to_pc2(ref_pts, ref_cols, "reference_model")
+                    if bone_name == "tibia":
+                        self.pub_tibia_ref_model.publish(model_msg)
+                    else:
+                        self.pub_femur_ref_model.publish(model_msg)
+                    self.get_logger().info(
+                        f"  Published model-frame reference ({len(ref_pts)} pts) for {bone_name}"
+                    )
+                except Exception as e:
+                    self.get_logger().error(
+                        f"  Failed to publish model reference for {bone_name}: {e}"
+                    )
+
+        # Save report
+        report_path = os.path.join(
+            OUTPUT_DIR, f"multi_orient_report_{timestamp}.json"
+        )
+        # Convert numpy types for JSON
+        def _json_safe(obj):
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, (np.float32, np.float64)):
+                return float(obj)
+            if isinstance(obj, (np.int32, np.int64)):
+                return int(obj)
+            return obj
+
+        safe_report = json.loads(json.dumps(report, default=_json_safe))
+        with open(report_path, "w") as f:
+            json.dump(safe_report, f, indent=2)
+        self.get_logger().info(f"  Report saved: {report_path}")
+
+        self._publish_mo_status(
+            f"MULTI-ORIENTATION CALIBRATION COMPLETE. "
+            f"Calibration files saved to {OUTPUT_DIR}"
+        )
 
     # ──────────────────────────────────────────────────────────────────
     # YOLO Detection — per-instance depth masking & back-projection
@@ -663,7 +1026,7 @@ class DetectAndMergeNode(Node):
             quat = np.array([
                 t.rotation.x, t.rotation.y, t.rotation.z, t.rotation.w
             ])
-            rot = self._quat_to_rotation_matrix(quat)
+            rot = quat_to_rotation_matrix(quat)
             self.get_logger().info(
                 f"    TF: t=[{trans[0]:.4f}, {trans[1]:.4f}, {trans[2]:.4f}]"
             )
@@ -982,6 +1345,13 @@ class DetectAndMergeNode(Node):
                 f"z=[{aligned_ref_pts[:,2].min():.3f},{aligned_ref_pts[:,2].max():.3f}]"
             )
 
+            # Store metrics for multi-orientation solver
+            self._last_icp_metrics[bone_name] = {
+                "fitness": result["fitness"],
+                "rmse": result["rmse"],
+                "T_icp": T_ref_to_base.copy(),
+            }
+
             # Save transform + aligned reference PLY
             np.save(
                 os.path.join(OUTPUT_DIR, f"{bone_name}_icp_T_ref2base_{timestamp}.npy"),
@@ -997,8 +1367,8 @@ class DetectAndMergeNode(Node):
                 self.get_logger().info(f"  Saved: {ref_path_out}")
 
             # PointCloud2 messages — all in lbr_link_0
-            scan_msg = self._numpy_to_pc2(scan_pts, scan_cols, frame_id)
-            ref_msg = self._numpy_to_pc2(aligned_ref_pts, aligned_ref_cols, frame_id)
+            scan_msg = numpy_to_pc2(scan_pts, scan_cols, frame_id)
+            ref_msg = numpy_to_pc2(aligned_ref_pts, aligned_ref_cols, frame_id)
 
             if bone_name == "tibia":
                 self._registered_msgs["tibia_aligned"] = scan_msg
@@ -1010,63 +1380,6 @@ class DetectAndMergeNode(Node):
             self.get_logger().info(
                 f"  {bone_name}: publishing scan + ref in {frame_id}"
             )
-
-    # ──────────────────────────────────────────────────────────────────
-    # PointCloud2 Conversion
-    # ──────────────────────────────────────────────────────────────────
-    @staticmethod
-    def _numpy_to_pc2(points, colors, frame_id):
-        """
-        Convert (N,3) points + optional (N,3) RGB colors to PointCloud2.
-        Vectorized using numpy — fast and correct for large clouds.
-        """
-        n = len(points)
-        if n == 0:
-            msg = PointCloud2()
-            msg.header = Header()
-            msg.header.frame_id = frame_id
-            msg.height = 1
-            msg.width = 0
-            return msg
-
-        pts = points.astype(np.float32)
-
-        # Pack RGB into a single float32 (RViz convention)
-        if colors is not None and len(colors) == n:
-            cols = np.clip(colors * 255, 0, 255).astype(np.uint8)
-            rgb_uint32 = (cols[:, 0].astype(np.uint32) << 16 |
-                          cols[:, 1].astype(np.uint32) << 8 |
-                          cols[:, 2].astype(np.uint32))
-        else:
-            rgb_uint32 = np.full(n, (200 << 16) | (200 << 8) | 200, dtype=np.uint32)
-
-        # Reinterpret uint32 as float32 (bit-level cast, not conversion)
-        rgb_float = rgb_uint32.view(np.float32)
-
-        # Build XYZRGB array: (N, 4) float32
-        data = np.column_stack([pts, rgb_float.reshape(-1, 1)])
-
-        fields = [
-            PointField(name="x", offset=0,  datatype=PointField.FLOAT32, count=1),
-            PointField(name="y", offset=4,  datatype=PointField.FLOAT32, count=1),
-            PointField(name="z", offset=8,  datatype=PointField.FLOAT32, count=1),
-            PointField(name="rgb", offset=12, datatype=PointField.FLOAT32, count=1),
-        ]
-        point_step = 16  # 4 x float32
-
-        msg = PointCloud2()
-        msg.header = Header()
-        msg.header.frame_id = frame_id
-        msg.height = 1
-        msg.width = n
-        msg.fields = fields
-        msg.is_bigendian = False
-        msg.point_step = point_step
-        msg.row_step = point_step * n
-        msg.data = data.tobytes()
-        msg.is_dense = True
-
-        return msg
 
     # ──────────────────────────────────────────────────────────────────
     # Periodic Publish (latch for RViz)
@@ -1117,36 +1430,6 @@ class DetectAndMergeNode(Node):
         with open(path, "w") as f:
             json.dump(manifest, f, indent=2)
         self.get_logger().info(f"  Manifest: {path}")
-
-    # ──────────────────────────────────────────────────────────────────
-    # Utilities
-    # ──────────────────────────────────────────────────────────────────
-    @staticmethod
-    def _quat_to_rotation_matrix(q):
-        x, y, z, w = q
-        return np.array([
-            [1-2*(y*y+z*z),   2*(x*y-z*w),   2*(x*z+y*w)],
-            [  2*(x*y+z*w), 1-2*(x*x+z*z),   2*(y*z-x*w)],
-            [  2*(x*z-y*w),   2*(y*z+x*w), 1-2*(x*x+y*y)],
-        ])
-
-    @staticmethod
-    def _parse_target_classes(cls_str):
-        """Parse target classes from string param. Returns list of ints or []."""
-        if not cls_str or cls_str.strip() == "":
-            return []
-        cls_str = cls_str.strip()
-        # Handle JSON list: [0, 1, 2]
-        if cls_str.startswith("["):
-            try:
-                return [int(c) for c in json.loads(cls_str)]
-            except json.JSONDecodeError:
-                pass
-        # Handle comma-separated: 0,1,2
-        try:
-            return [int(c.strip()) for c in cls_str.split(",") if c.strip()]
-        except ValueError:
-            return []
 
     def _extract_joint_positions(self, msg: JointState):
         try:

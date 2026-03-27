@@ -85,6 +85,14 @@ def generate_launch_description():
     # Bone cloud mover
     run_bone_mover = LaunchConfiguration("run_bone_mover")
 
+    # Multi-orientation calibration
+    multi_orientation = LaunchConfiguration("multi_orientation")
+    n_orientations = LaunchConfiguration("n_orientations")
+
+    # Bone cloud mover calibration paths
+    ref_to_tracker_tibia = LaunchConfiguration("ref_to_tracker_tibia")
+    ref_to_tracker_femur = LaunchConfiguration("ref_to_tracker_femur")
+
     return LaunchDescription([
 
         # ── Arguments: Camera mount transform ──
@@ -114,17 +122,17 @@ def generate_launch_description():
                               description="Launch RViz"),
 
         # ── Arguments: Detect node ──
-        DeclareLaunchArgument("run_detect", default_value="false",
+        DeclareLaunchArgument("run_detect", default_value="true",
                               description="Launch detect_and_merge_node"),
-        DeclareLaunchArgument("scan_node", default_value="true",
+        DeclareLaunchArgument("scan_node", default_value="false",
                               description="Launch scan_and_merge_node (disable if only detecting)"),
-        DeclareLaunchArgument("weights", default_value="",
+        DeclareLaunchArgument("weights", default_value="~/scan_output/best.pt",
                               description="Path to YOLO .pt weights"),
         DeclareLaunchArgument("target_classes", default_value="",
                               description="YOLO class IDs to keep (comma-sep or JSON list, empty = all)"),
-        DeclareLaunchArgument("confidence", default_value="0.5",
+        DeclareLaunchArgument("confidence", default_value="0.8",
                               description="YOLO confidence threshold"),
-        DeclareLaunchArgument("use_seg_mask", default_value="false",
+        DeclareLaunchArgument("use_seg_mask", default_value="true",
                               description="Use segmentation masks instead of bounding boxes"),
 
         # ── Arguments: Waypoint visualizer ──
@@ -134,6 +142,16 @@ def generate_launch_description():
         # ── Arguments: Bone cloud mover ──
         DeclareLaunchArgument("run_bone_mover", default_value="true",
                               description="Launch bone cloud mover (tracks aligned clouds with IR trackers)"),
+        DeclareLaunchArgument("ref_to_tracker_tibia", default_value="",
+                              description="Path to T_ref_to_tracker .npy for tibia (multi-orient calibration)"),
+        DeclareLaunchArgument("ref_to_tracker_femur", default_value="",
+                              description="Path to T_ref_to_tracker .npy for femur (multi-orient calibration)"),
+
+        # ── Arguments: Multi-orientation calibration ──
+        DeclareLaunchArgument("multi_orientation", default_value="true",
+                              description="Enable multi-orientation ICP calibration mode"),
+        DeclareLaunchArgument("n_orientations", default_value="2",
+                              description="Number of bone orientations to collect"),
 
         # ── 1. RealSense Camera ──
         Node(
@@ -234,6 +252,8 @@ def generate_launch_description():
                         "confidence": confidence,
                         "velocity_scaling": velocity_scaling,
                         "use_seg_mask": use_seg_mask,
+                        "multi_orientation": multi_orientation,
+                        "n_orientations": n_orientations,
                     }],
                 ),
             ],
@@ -268,6 +288,8 @@ def generate_launch_description():
             output="screen",
             parameters=[{
                 "publish_rate": 20.0,
+                "ref_to_tracker_tibia": ref_to_tracker_tibia,
+                "ref_to_tracker_femur": ref_to_tracker_femur,
             }],
         ),
     ])

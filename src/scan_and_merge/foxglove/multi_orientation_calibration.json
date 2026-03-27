@@ -1,0 +1,235 @@
+{
+  "configById": {
+    "3D!3dview1": {
+      "cameraState": {
+        "perspective": true,
+        "distance": 1.8,
+        "phi": 55,
+        "thetaOffset": 50,
+        "targetOffset": [0, 0, 0],
+        "target": [0, 0, 0.35],
+        "targetOrientation": [0, 0, 0, 1],
+        "fovy": 45,
+        "near": 0.005,
+        "far": 5000
+      },
+      "followMode": "follow-none",
+      "followTf": "",
+      "scene": {
+        "transforms": {
+          "showLabel": false,
+          "axisScale": 0.15,
+          "lineWidth": 1,
+          "lineColor": "#ffffff40"
+        },
+        "enableStats": false,
+        "backgroundColor": "#1a1a2e",
+        "labelScaleFactor": 1
+      },
+      "topics": {
+        "/tracked/reference/femur": {
+          "visible": true,
+          "colorMode": "flat",
+          "flatColor": "#cc6600",
+          "pointSize": 3,
+          "pointShape": "circle"
+        },
+        "/tracked/reference/tibia": {
+          "visible": true,
+          "colorMode": "flat",
+          "flatColor": "#00b858",
+          "pointSize": 3,
+          "pointShape": "circle"
+        },
+        "/tracked/registered/femur": {
+          "visible": true,
+          "colorMode": "rgb",
+          "pointSize": 3,
+          "pointShape": "circle"
+        },
+        "/tracked/registered/tibia": {
+          "visible": true,
+          "colorMode": "rgb",
+          "pointSize": 3,
+          "pointShape": "circle"
+        },
+        "/kuka_frame/bone_pose_femur": {
+          "visible": true,
+          "color": "#ff8c00",
+          "axisScale": 0.1,
+          "type": "axis"
+        },
+        "/kuka_frame/bone_pose_tibia": {
+          "visible": true,
+          "color": "#00cc66",
+          "axisScale": 0.1,
+          "type": "axis"
+        },
+        "/kuka_frame/pose_ee": {
+          "visible": true,
+          "color": "#4a9eff",
+          "axisScale": 0.08,
+          "type": "axis"
+        },
+        "/reference/femur": {
+          "visible": false,
+          "colorMode": "flat",
+          "flatColor": "#994400",
+          "pointSize": 2
+        },
+        "/reference/tibia": {
+          "visible": false,
+          "colorMode": "flat",
+          "flatColor": "#007733",
+          "pointSize": 2
+        },
+        "/registered/femur": {
+          "visible": false,
+          "colorMode": "rgb",
+          "pointSize": 2
+        },
+        "/registered/tibia": {
+          "visible": false,
+          "colorMode": "rgb",
+          "pointSize": 2
+        },
+        "/camera_arm/camera/depth/color/points": {
+          "visible": false,
+          "colorMode": "rgb",
+          "pointSize": 1
+        }
+      },
+      "layers": {
+        "4e5f6a7b-grid": {
+          "layerId": "foxglove.Grid",
+          "size": 2,
+          "divisions": 20,
+          "color": "#50506840",
+          "position": [0, 0, 0],
+          "rotation": [0, 0, 0, 1],
+          "frameId": "lbr_link_0",
+          "lineWidth": 1
+        },
+        "8a9b0c1d-urdf": {
+          "layerId": "foxglove.Urdf",
+          "sourceType": "topic",
+          "topic": "/lbr/robot_description",
+          "framePrefix": ""
+        }
+      },
+      "publish": {
+        "type": "point",
+        "pointTopic": "/clicked_point"
+      }
+    },
+
+    "RawMessages!status1": {
+      "topicPath": "/multi_orient/status.data",
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "fontSize": 18
+    },
+
+    "Publish!pub_keep": {
+      "topicName": "/multi_orient/command",
+      "datatype": "std_msgs/msg/String",
+      "buttonText": "KEEP Registration",
+      "buttonTooltip": "Accept this orientation's ICP result for the final least-squares solve",
+      "buttonColor": "#27ae60",
+      "advancedView": false,
+      "value": "{ \"data\": \"keep\" }"
+    },
+    "Publish!pub_discard": {
+      "topicName": "/multi_orient/command",
+      "datatype": "std_msgs/msg/String",
+      "buttonText": "DISCARD Registration",
+      "buttonTooltip": "Reject this orientation's ICP result — it will not be used in the solve",
+      "buttonColor": "#c0392b",
+      "advancedView": false,
+      "value": "{ \"data\": \"discard\" }"
+    },
+    "Publish!pub_ready": {
+      "topicName": "/multi_orient/command",
+      "datatype": "std_msgs/msg/String",
+      "buttonText": "Bones Repositioned \u2014 Start Next Scan",
+      "buttonTooltip": "Bones have been moved to a new orientation, run the next scan+ICP cycle",
+      "buttonColor": "#2980b9",
+      "advancedView": false,
+      "value": "{ \"data\": \"ready\" }"
+    },
+    "Publish!pub_solve": {
+      "topicName": "/multi_orient/command",
+      "datatype": "std_msgs/msg/String",
+      "buttonText": "All Positions Done \u2014 Run Solver",
+      "buttonTooltip": "No more orientations needed — run the least-squares calibration now",
+      "buttonColor": "#d4a017",
+      "advancedView": false,
+      "value": "{ \"data\": \"solve\" }"
+    },
+
+    "Image!cam1": {
+      "imageTopic": "/camera_arm/camera/color/image_rect_raw",
+      "calibrationTopic": "",
+      "synchronize": false,
+      "transformMarkers": false,
+      "smooth": false,
+      "flipHorizontal": false,
+      "flipVertical": false,
+      "minValue": 0,
+      "maxValue": 1,
+      "mode": "fit",
+      "pan": { "x": 0, "y": 0 },
+      "rotation": 0,
+      "zoom": 1
+    },
+
+    "Log!log1": {
+      "searchTerms": [],
+      "minLogLevel": 1,
+      "nameFilter": { "detect_and_merge_node": "match", "bone_cloud_mover": "match" }
+    }
+  },
+
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": { "speed": 1 },
+
+  "layout": {
+    "direction": "row",
+    "splitPercentage": 62,
+    "first": "3D!3dview1",
+    "second": {
+      "direction": "column",
+      "splitPercentage": 14,
+      "first": "RawMessages!status1",
+      "second": {
+        "direction": "column",
+        "splitPercentage": 52,
+        "first": {
+          "direction": "column",
+          "splitPercentage": 50,
+          "first": {
+            "direction": "row",
+            "splitPercentage": 50,
+            "first": "Publish!pub_keep",
+            "second": "Publish!pub_discard"
+          },
+          "second": {
+            "direction": "row",
+            "splitPercentage": 50,
+            "first": "Publish!pub_ready",
+            "second": "Publish!pub_solve"
+          }
+        },
+        "second": {
+          "direction": "column",
+          "splitPercentage": 60,
+          "first": "Image!cam1",
+          "second": "Log!log1"
+        }
+      }
+    }
+  }
+}
