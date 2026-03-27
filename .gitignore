@@ -19,7 +19,6 @@ runs/
 # Point cloud outputs
 detect_output/
 scan_output/
-*.ply
 *.npy
 
 # IDE
