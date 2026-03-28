@@ -147,6 +147,8 @@ class DetectAndMergeNode(Node):
         self.declare_parameter("register", True)
         self.declare_parameter("tibia_reference",
             os.path.join(pkg_share, "resource", "tibia.ply"))
+        self.declare_parameter("femur_reference",
+            os.path.join(pkg_share, "resource", "femur.ply"))
 
         self.declare_parameter("icp_coarse_method", "fpfh")
         self.declare_parameter("icp_voxel_size", 0.002)
