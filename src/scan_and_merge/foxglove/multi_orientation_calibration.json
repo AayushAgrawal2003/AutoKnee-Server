@@ -27,29 +27,17 @@
         "labelScaleFactor": 1
       },
       "topics": {
-        "/tracked/reference/femur": {
+        "/tracked/femur": {
           "visible": true,
           "colorMode": "flat",
           "flatColor": "#cc6600",
           "pointSize": 3,
           "pointShape": "circle"
         },
-        "/tracked/reference/tibia": {
+        "/tracked/tibia": {
           "visible": true,
           "colorMode": "flat",
           "flatColor": "#00b858",
-          "pointSize": 3,
-          "pointShape": "circle"
-        },
-        "/tracked/registered/femur": {
-          "visible": true,
-          "colorMode": "rgb",
-          "pointSize": 3,
-          "pointShape": "circle"
-        },
-        "/tracked/registered/tibia": {
-          "visible": true,
-          "colorMode": "rgb",
           "pointSize": 3,
           "pointShape": "circle"
         },
@@ -71,24 +59,24 @@
           "axisScale": 0.08,
           "type": "axis"
         },
-        "/reference/femur": {
+        "/bone_model/femur": {
           "visible": false,
           "colorMode": "flat",
           "flatColor": "#994400",
           "pointSize": 2
         },
-        "/reference/tibia": {
+        "/bone_model/tibia": {
           "visible": false,
           "colorMode": "flat",
           "flatColor": "#007733",
           "pointSize": 2
         },
-        "/registered/femur": {
+        "/bone_scan/femur": {
           "visible": false,
           "colorMode": "rgb",
           "pointSize": 2
         },
-        "/registered/tibia": {
+        "/bone_scan/tibia": {
           "visible": false,
           "colorMode": "rgb",
           "pointSize": 2
