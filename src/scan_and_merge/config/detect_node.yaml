@@ -36,3 +36,8 @@ detect_and_merge_node:
     multi_orientation: false
     n_orientations: 3
     tracker_avg_samples: 50
+
+    # ── Perpendicular View Adjustment ──
+    perpendicular_adjust: false     # enable camera reorientation at each waypoint
+    perp_max_angle_deg: 25.0        # skip if required rotation exceeds this (degrees)
+    perp_free_joints: 3             # number of wrist joints free to move (2 or 3: A5/A6 or A5/A6/A7)

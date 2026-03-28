@@ -47,6 +47,7 @@ from moveit_msgs.msg import (
     PlanningOptions,
     Constraints,
     JointConstraint,
+    OrientationConstraint,
 )
 
 import numpy as np
@@ -109,6 +110,41 @@ PLANNING_TIME = 10.0
 MAX_DEPTH_M = 1.0
 
 OUTPUT_DIR = os.path.expanduser("~/detect_output")
+EE_LINK = f"{ROBOT_NAME}_link_ee"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────
+
+def _rot_to_quat(R):
+    """Convert a 3x3 rotation matrix to a quaternion [x, y, z, w]."""
+    trace = R[0, 0] + R[1, 1] + R[2, 2]
+    if trace > 0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (R[2, 1] - R[1, 2]) * s
+        y = (R[0, 2] - R[2, 0]) * s
+        z = (R[1, 0] - R[0, 1]) * s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+    return np.array([x, y, z, w])
 
 
 class DetectAndMergeNode(Node):
@@ -171,6 +207,11 @@ class DetectAndMergeNode(Node):
         self.declare_parameter("multi_orientation", False)
         self.declare_parameter("n_orientations", 3)
         self.declare_parameter("tracker_avg_samples", 50)
+
+        # Perpendicular view adjustment params
+        self.declare_parameter("perpendicular_adjust", False)
+        self.declare_parameter("perp_max_angle_deg", 25.0)
+        self.declare_parameter("perp_free_joints", 3)  # 2 or 3 free joints from the wrist end
 
         self.cb_group = ReentrantCallbackGroup()
 
@@ -361,6 +402,11 @@ class DetectAndMergeNode(Node):
         self.n_orientations = self.get_parameter("n_orientations").get_parameter_value().integer_value
         self.tracker_avg_samples = self.get_parameter("tracker_avg_samples").get_parameter_value().integer_value
 
+        # Perpendicular view adjustment params
+        self.perpendicular_adjust = self.get_parameter("perpendicular_adjust").get_parameter_value().bool_value
+        self.perp_max_angle_deg = self.get_parameter("perp_max_angle_deg").get_parameter_value().double_value
+        self.perp_free_joints = self.get_parameter("perp_free_joints").get_parameter_value().integer_value
+
         # ── Parse target classes ──
         self.target_classes = parse_target_classes(target_cls_str)
         if self.target_classes:
@@ -445,6 +491,15 @@ class DetectAndMergeNode(Node):
                 f"  Settling {self.settle_time:.1f}s..."
             )
             time.sleep(self.settle_time)
+
+            # After first detection, reorient camera perpendicular to bone centroid
+            if self.perpendicular_adjust and self.waypoint_clouds:
+                adjusted = self._adjust_view_perpendicular(velocity)
+                if adjusted:
+                    self.get_logger().info(
+                        f"  Settling {self.settle_time:.1f}s after adjustment..."
+                    )
+                    time.sleep(self.settle_time)
 
             rot, trans = self._capture_current_transform()
             self._detect_and_capture(i, rot, trans)
@@ -571,6 +626,15 @@ class DetectAndMergeNode(Node):
 
                 self.get_logger().info(f"  Settling {self.settle_time:.1f}s...")
                 time.sleep(self.settle_time)
+
+                # After first detection, reorient camera perpendicular to bone centroid
+                if self.perpendicular_adjust and self.waypoint_clouds:
+                    adjusted = self._adjust_view_perpendicular(velocity)
+                    if adjusted:
+                        self.get_logger().info(
+                            f"  Settling {self.settle_time:.1f}s after adjustment..."
+                        )
+                        time.sleep(self.settle_time)
 
                 rot, trans = self._capture_current_transform()
                 self._detect_and_capture(i, rot, trans)
@@ -1156,6 +1220,216 @@ class DetectAndMergeNode(Node):
                 f"  MoveIt error: {result.result.error_code.val}"
             )
             return False
+
+    # ──────────────────────────────────────────────────────────────────
+    # Perpendicular View Adjustment
+    # ──────────────────────────────────────────────────────────────────
+    def _adjust_view_perpendicular(self, velocity) -> bool:
+        """
+        Reorient the camera to look perpendicularly toward the centroid of all
+        currently accumulated bone scan points.
+
+        Only the top `perp_free_joints` wrist joints (A5–A7) are allowed to move:
+        joints A1 through (7 - perp_free_joints) are locked at their current
+        positions via tight JointConstraints, and an OrientationConstraint drives
+        the end-effector to the desired camera orientation.
+
+        Skips silently if:
+          - no accumulated clouds are available yet
+          - the required angle delta is < 1° (already aligned)
+          - the required angle delta is > perp_max_angle_deg (would move too much)
+          - any TF lookup or MoveIt call fails
+        """
+        if not self.waypoint_clouds:
+            return False
+
+        # ── Compute bone centroid in base frame ──
+        all_pts = []
+        for entry in self.waypoint_clouds:
+            pts = entry["points_cam"]
+            rot = entry["rotation"]
+            trans = entry["translation"]
+            if len(pts) == 0:
+                continue
+            pts_base = (rot @ pts.T).T + trans
+            all_pts.append(pts_base)
+
+        if not all_pts:
+            return False
+
+        centroid = np.mean(np.vstack(all_pts), axis=0)
+
+        # ── Get current camera pose from TF ──
+        try:
+            tf_cam = self.tf_buffer.lookup_transform(
+                BASE_FRAME, CAMERA_FRAME,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=2.0),
+            )
+            cam_trans = np.array([
+                tf_cam.transform.translation.x,
+                tf_cam.transform.translation.y,
+                tf_cam.transform.translation.z,
+            ])
+            cam_quat = np.array([
+                tf_cam.transform.rotation.x,
+                tf_cam.transform.rotation.y,
+                tf_cam.transform.rotation.z,
+                tf_cam.transform.rotation.w,
+            ])
+            R_cam = quat_to_rotation_matrix(cam_quat)
+        except Exception as e:
+            self.get_logger().warn(f"  [perp_adjust] Camera TF lookup failed: {e}")
+            return False
+
+        # ── Get current EE pose from TF ──
+        try:
+            tf_ee = self.tf_buffer.lookup_transform(
+                BASE_FRAME, EE_LINK,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=2.0),
+            )
+            ee_quat = np.array([
+                tf_ee.transform.rotation.x,
+                tf_ee.transform.rotation.y,
+                tf_ee.transform.rotation.z,
+                tf_ee.transform.rotation.w,
+            ])
+            R_ee = quat_to_rotation_matrix(ee_quat)
+        except Exception as e:
+            self.get_logger().warn(f"  [perp_adjust] EE TF lookup failed: {e}")
+            return False
+
+        # ── Compute desired camera z-axis (pointing toward centroid) ──
+        direction = centroid - cam_trans
+        dist = np.linalg.norm(direction)
+        if dist < 0.01:
+            self.get_logger().warn(
+                "  [perp_adjust] Centroid too close to camera, skipping."
+            )
+            return False
+
+        z_new = direction / dist
+
+        # ── Check angle between current and desired optical axis ──
+        z_current = R_cam[:, 2]
+        cos_angle = float(np.clip(np.dot(z_current, z_new), -1.0, 1.0))
+        angle_deg = float(np.degrees(np.arccos(cos_angle)))
+
+        if angle_deg < 1.0:
+            self.get_logger().info(
+                f"  [perp_adjust] Already aligned ({angle_deg:.1f}°), skipping."
+            )
+            return False
+
+        if angle_deg > self.perp_max_angle_deg:
+            self.get_logger().warn(
+                f"  [perp_adjust] Required rotation {angle_deg:.1f}° > "
+                f"max {self.perp_max_angle_deg:.1f}°, skipping."
+            )
+            return False
+
+        # ── Build new camera rotation matrix ──
+        # Keep current camera y as "up" reference
+        y_ref = R_cam[:, 1]
+        y_new = y_ref - np.dot(y_ref, z_new) * z_new
+        if np.linalg.norm(y_new) < 1e-6:
+            # Degenerate: camera y is parallel to z_new — use world z instead
+            fallback = np.array([0.0, 0.0, 1.0])
+            y_new = fallback - np.dot(fallback, z_new) * z_new
+        y_new = y_new / np.linalg.norm(y_new)
+        x_new = np.cross(y_new, z_new)
+        x_new = x_new / np.linalg.norm(x_new)
+        R_cam_new = np.column_stack([x_new, y_new, z_new])
+
+        # Propagate rotation delta to end-effector
+        R_delta = R_cam_new @ R_cam.T
+        R_ee_new = R_delta @ R_ee
+        q_ee_new = _rot_to_quat(R_ee_new)
+
+        # ── Get current joint positions ──
+        js = self.latest_joint_state
+        if js is None:
+            self.get_logger().warn("  [perp_adjust] No joint state available, skipping.")
+            return False
+        joint_map = dict(zip(js.name, js.position))
+
+        # ── Build MoveIt goal ──
+        # Lock all joints except the last `perp_free_joints` (wrist joints)
+        n_locked = max(0, len(JOINT_NAMES) - max(2, min(3, self.perp_free_joints)))
+
+        goal = MoveGroup.Goal()
+        req = MotionPlanRequest()
+        req.group_name = PLANNING_GROUP
+        req.num_planning_attempts = 5
+        req.allowed_planning_time = PLANNING_TIME
+        req.max_velocity_scaling_factor = velocity
+        req.max_acceleration_scaling_factor = velocity
+
+        goal_constraints = Constraints()
+
+        # Tight joint locks on proximal joints
+        for jname in JOINT_NAMES[:n_locked]:
+            jval = joint_map.get(jname)
+            if jval is None:
+                continue
+            jc = JointConstraint()
+            jc.joint_name = jname
+            jc.position = float(jval)
+            jc.tolerance_above = 0.005
+            jc.tolerance_below = 0.005
+            jc.weight = 1.0
+            goal_constraints.joint_constraints.append(jc)
+
+        # Orientation constraint on EE
+        oc = OrientationConstraint()
+        oc.header.frame_id = BASE_FRAME
+        oc.link_name = EE_LINK
+        oc.orientation.x = float(q_ee_new[0])
+        oc.orientation.y = float(q_ee_new[1])
+        oc.orientation.z = float(q_ee_new[2])
+        oc.orientation.w = float(q_ee_new[3])
+        oc.absolute_x_axis_tolerance = 0.1   # ~6 deg
+        oc.absolute_y_axis_tolerance = 0.1
+        oc.absolute_z_axis_tolerance = 0.1
+        oc.weight = 1.0
+        goal_constraints.orientation_constraints.append(oc)
+
+        req.goal_constraints.append(goal_constraints)
+        goal.request = req
+        goal.planning_options = PlanningOptions()
+        goal.planning_options.plan_only = False
+        goal.planning_options.replan = True
+        goal.planning_options.replan_attempts = 3
+
+        self.get_logger().info(
+            f"  [perp_adjust] Rotating camera {angle_deg:.1f}° → centroid "
+            f"[{centroid[0]:.3f}, {centroid[1]:.3f}, {centroid[2]:.3f}] "
+            f"(locking {n_locked}/{len(JOINT_NAMES)} joints, "
+            f"free: {JOINT_NAMES[n_locked:]})"
+        )
+
+        future = self.move_group_client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=15.0)
+        goal_handle = future.result()
+
+        if not goal_handle or not goal_handle.accepted:
+            self.get_logger().warn("  [perp_adjust] Goal rejected, continuing from original pose.")
+            return False
+
+        result_future = goal_handle.get_result_async()
+        rclpy.spin_until_future_complete(self, result_future, timeout_sec=60.0)
+        result = result_future.result()
+
+        if result is None or result.result.error_code.val != 1:
+            ec = result.result.error_code.val if result else "timeout"
+            self.get_logger().warn(
+                f"  [perp_adjust] Motion failed (error={ec}), continuing from original pose."
+            )
+            return False
+
+        self.get_logger().info("  [perp_adjust] Camera reoriented successfully.")
+        return True
 
     # ──────────────────────────────────────────────────────────────────
     # Cloud Merging — per-instance + combined
