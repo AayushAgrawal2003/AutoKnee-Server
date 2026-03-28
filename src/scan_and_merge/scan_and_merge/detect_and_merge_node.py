@@ -47,8 +47,10 @@ from moveit_msgs.msg import (
     PlanningOptions,
     Constraints,
     JointConstraint,
-    OrientationConstraint,
 )
+from moveit_msgs.srv import GetPositionIK
+from moveit_msgs.msg import PositionIKRequest, RobotState as MoveItRobotState
+from geometry_msgs.msg import PoseStamped as GeomPoseStamped
 
 import numpy as np
 import threading
@@ -259,6 +261,13 @@ class DetectAndMergeNode(Node):
         # ── MoveIt2 ──
         self.move_group_client = ActionClient(
             self, MoveGroup, "/lbr/move_action",
+            callback_group=self.cb_group,
+        )
+        # IK service — used by perpendicular view adjustment to pre-compute
+        # exact joint targets before planning (avoids OrientationConstraint
+        # sampling failures with OMPL)
+        self._ik_client = self.create_client(
+            GetPositionIK, "/lbr/compute_ik",
             callback_group=self.cb_group,
         )
 
@@ -1231,16 +1240,20 @@ class DetectAndMergeNode(Node):
         Reorient the camera to look perpendicularly toward the centroid of all
         currently accumulated bone scan points.
 
-        Only the top `perp_free_joints` wrist joints (A5–A7) are allowed to move:
+        Strategy: compute the desired EE orientation, call MoveIt's IK service
+        (/lbr/compute_ik) to get exact joint angles, then plan with pure
+        JointConstraints.  This avoids OrientationConstraints which OMPL cannot
+        reliably sample (error 99999).
+
+        Only the top `perp_free_joints` wrist joints (A5–A7) are free; proximal
         joints A1 through (7 - perp_free_joints) are locked at their current
-        positions via tight JointConstraints, and an OrientationConstraint drives
-        the end-effector to the desired camera orientation.
+        values in the IK seed and in the resulting joint goal.
 
         Skips silently if:
           - no accumulated clouds are available yet
           - the required angle delta is < 1° (already aligned)
           - the required angle delta is > perp_max_angle_deg (would move too much)
-          - any TF lookup or MoveIt call fails
+          - any TF lookup, IK, or MoveIt call fails
         """
         if not self.waypoint_clouds:
             return False
@@ -1356,9 +1369,95 @@ class DetectAndMergeNode(Node):
             return False
         joint_map = dict(zip(js.name, js.position))
 
-        # ── Build MoveIt goal ──
-        # Lock all joints except the last `perp_free_joints` (wrist joints)
+        # Number of proximal joints to lock
         n_locked = max(0, len(JOINT_NAMES) - max(2, min(3, self.perp_free_joints)))
+
+        # ── Call IK service to get joint angles for desired EE orientation ──
+        # Build seed: current joint positions (A1-A4 locked, A5-A7 free to vary)
+        if not self._ik_client.wait_for_service(timeout_sec=3.0):
+            self.get_logger().warn("  [perp_adjust] IK service not available, skipping.")
+            return False
+
+        ik_req = GetPositionIK.Request()
+        ik_req.ik_request.group_name = PLANNING_GROUP
+        ik_req.ik_request.avoid_collisions = True
+        ik_req.ik_request.timeout.sec = 5
+
+        # Desired EE pose: keep current position, use new orientation
+        ps = GeomPoseStamped()
+        ps.header.frame_id = BASE_FRAME
+        ps.header.stamp = self.get_clock().now().to_msg()
+        ps.pose.position.x = tf_ee.transform.translation.x
+        ps.pose.position.y = tf_ee.transform.translation.y
+        ps.pose.position.z = tf_ee.transform.translation.z
+        ps.pose.orientation.x = float(q_ee_new[0])
+        ps.pose.orientation.y = float(q_ee_new[1])
+        ps.pose.orientation.z = float(q_ee_new[2])
+        ps.pose.orientation.w = float(q_ee_new[3])
+        ik_req.ik_request.pose_stamped = ps
+
+        # Seed state: current joints — keeps A1-A4 anchored so IK
+        # naturally finds a solution near the current wrist configuration
+        from sensor_msgs.msg import JointState as SensorJointState
+        seed_js = SensorJointState()
+        seed_js.name = JOINT_NAMES
+        seed_js.position = [float(joint_map.get(j, 0.0)) for j in JOINT_NAMES]
+        ik_req.ik_request.robot_state.joint_state = seed_js
+
+        ik_future = self._ik_client.call_async(ik_req)
+        rclpy.spin_until_future_complete(self, ik_future, timeout_sec=10.0)
+        ik_result = ik_future.result()
+
+        if ik_result is None or ik_result.error_code.val != 1:
+            ec = ik_result.error_code.val if ik_result else "timeout"
+            self.get_logger().warn(
+                f"  [perp_adjust] IK failed (error={ec}), skipping adjustment."
+            )
+            return False
+
+        # Extract solved joint positions
+        ik_joint_map = dict(
+            zip(ik_result.solution.joint_state.name,
+                ik_result.solution.joint_state.position)
+        )
+
+        # Verify the wrist actually moved — if IK returned same config, skip
+        wrist_delta = max(
+            abs(ik_joint_map.get(j, joint_map.get(j, 0.0)) - joint_map.get(j, 0.0))
+            for j in JOINT_NAMES[n_locked:]
+        )
+        if wrist_delta < 1e-4:
+            self.get_logger().info(
+                "  [perp_adjust] IK returned identical config, skipping."
+            )
+            return False
+
+        self.get_logger().info(
+            f"  [perp_adjust] IK solved — rotating camera {angle_deg:.1f}° → "
+            f"centroid [{centroid[0]:.3f}, {centroid[1]:.3f}, {centroid[2]:.3f}] "
+            f"(locking {n_locked}/{len(JOINT_NAMES)} joints, "
+            f"free: {JOINT_NAMES[n_locked:]})"
+        )
+
+        # ── Build MoveIt goal with pure JointConstraints ──
+        # Pure joint-space goals are trivial for OMPL — no sampling on manifolds.
+        goal_constraints = Constraints()
+        for jname in JOINT_NAMES:
+            # Use IK-solved value for free joints, current value for locked joints
+            if jname in JOINT_NAMES[:n_locked]:
+                jval = joint_map.get(jname, 0.0)
+                tol = 0.005   # tight lock
+            else:
+                jval = ik_joint_map.get(jname, joint_map.get(jname, 0.0))
+                tol = 0.01    # normal goal tolerance
+
+            jc = JointConstraint()
+            jc.joint_name = jname
+            jc.position = float(jval)
+            jc.tolerance_above = tol
+            jc.tolerance_below = tol
+            jc.weight = 1.0
+            goal_constraints.joint_constraints.append(jc)
 
         goal = MoveGroup.Goal()
         req = MotionPlanRequest()
@@ -1367,49 +1466,13 @@ class DetectAndMergeNode(Node):
         req.allowed_planning_time = PLANNING_TIME
         req.max_velocity_scaling_factor = velocity
         req.max_acceleration_scaling_factor = velocity
-
-        goal_constraints = Constraints()
-
-        # Tight joint locks on proximal joints
-        for jname in JOINT_NAMES[:n_locked]:
-            jval = joint_map.get(jname)
-            if jval is None:
-                continue
-            jc = JointConstraint()
-            jc.joint_name = jname
-            jc.position = float(jval)
-            jc.tolerance_above = 0.005
-            jc.tolerance_below = 0.005
-            jc.weight = 1.0
-            goal_constraints.joint_constraints.append(jc)
-
-        # Orientation constraint on EE
-        oc = OrientationConstraint()
-        oc.header.frame_id = BASE_FRAME
-        oc.link_name = EE_LINK
-        oc.orientation.x = float(q_ee_new[0])
-        oc.orientation.y = float(q_ee_new[1])
-        oc.orientation.z = float(q_ee_new[2])
-        oc.orientation.w = float(q_ee_new[3])
-        oc.absolute_x_axis_tolerance = 0.1   # ~6 deg
-        oc.absolute_y_axis_tolerance = 0.1
-        oc.absolute_z_axis_tolerance = 0.1
-        oc.weight = 1.0
-        goal_constraints.orientation_constraints.append(oc)
-
         req.goal_constraints.append(goal_constraints)
+
         goal.request = req
         goal.planning_options = PlanningOptions()
         goal.planning_options.plan_only = False
         goal.planning_options.replan = True
         goal.planning_options.replan_attempts = 3
-
-        self.get_logger().info(
-            f"  [perp_adjust] Rotating camera {angle_deg:.1f}° → centroid "
-            f"[{centroid[0]:.3f}, {centroid[1]:.3f}, {centroid[2]:.3f}] "
-            f"(locking {n_locked}/{len(JOINT_NAMES)} joints, "
-            f"free: {JOINT_NAMES[n_locked:]})"
-        )
 
         future = self.move_group_client.send_goal_async(goal)
         rclpy.spin_until_future_complete(self, future, timeout_sec=15.0)
