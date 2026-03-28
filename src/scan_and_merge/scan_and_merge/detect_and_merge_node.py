@@ -81,7 +81,7 @@ from scan_and_merge.icp_registration import register_bone
 from scan_and_merge.multi_orientation_solver import solve_with_outlier_rejection
 from scan_and_merge.mo_utils import (
     quat_to_rotation_matrix, numpy_to_pc2,
-    parse_target_classes, MultiOrientHelper,
+    parse_target_classes, MultiOrientHelper, invert_transform,
 )
 
 
@@ -509,6 +509,13 @@ class DetectAndMergeNode(Node):
             "femur": [],
         }
 
+        # Accumulated denoised clouds per bone across orientations.
+        # Each entry: {"points_base": (N,3), "colors": (N,3)|None,
+        #              "T_tracker": 4x4, "orientation_idx": int}
+        # After each orientation we REPLACE with the single merged result,
+        # so at most one entry per bone at any time.
+        accumulated_clouds = {"bone_left": [], "bone_right": []}
+
         self._publish_mo_status(
             f"MULTI-ORIENTATION MODE: {self.n_orientations} orientations planned. "
             f"Commands: publish to /multi_orient/command"
@@ -565,6 +572,36 @@ class DetectAndMergeNode(Node):
                 rot, trans = self._capture_current_transform()
                 self._detect_and_capture(i, rot, trans)
 
+            # ── Inject accumulated clouds from prior orientations ──
+            if orientation_idx > 0:
+                bone_tracker_pairs = [
+                    ("bone_left", T_tracker_tibia),
+                    ("bone_right", T_tracker_femur),
+                ]
+                for bone_id, current_T_tracker in bone_tracker_pairs:
+                    if current_T_tracker is None:
+                        continue
+                    for prev in accumulated_clouds[bone_id]:
+                        # T_delta moves points from old bone position to current
+                        T_delta = current_T_tracker @ invert_transform(prev["T_tracker"])
+                        old_pts = prev["points_base"]
+                        transformed = (T_delta[:3, :3] @ old_pts.T).T + T_delta[:3, 3]
+                        # Inject as synthetic waypoint entry (identity TF — already in base)
+                        self.waypoint_clouds.append({
+                            "label": f"accum_ori{prev['orientation_idx']}_{bone_id}",
+                            "bone_id": bone_id,
+                            "class_name": "accumulated",
+                            "wp_idx": -1,
+                            "points_cam": transformed,
+                            "colors": prev["colors"],
+                            "rotation": np.eye(3),
+                            "translation": np.zeros(3),
+                        })
+                        self.get_logger().info(
+                            f"  Injected {len(old_pts)} accumulated pts for {bone_id} "
+                            f"from orientation {prev['orientation_idx']+1}"
+                        )
+
             # ── Merge + denoise ──
             if self.waypoint_clouds:
                 self.get_logger().info(
@@ -575,6 +612,25 @@ class DetectAndMergeNode(Node):
                 self._merge_clouds()
             else:
                 self.get_logger().warn("No clouds to merge for this orientation!")
+
+            # ── Update accumulated clouds with merged+denoised result ──
+            # Replace prior accumulated entries with the single combined cloud
+            # (which now includes old accumulated + new scan data, all denoised).
+            for bone_id, tracker_T in [("bone_left", T_tracker_tibia),
+                                        ("bone_right", T_tracker_femur)]:
+                if bone_id in self.denoise_results and tracker_T is not None:
+                    pts = self.denoise_results[bone_id]["points"]
+                    cols = self.denoise_results[bone_id]["colors"]
+                    accumulated_clouds[bone_id] = [{
+                        "points_base": pts.copy(),
+                        "colors": cols.copy() if cols is not None else None,
+                        "T_tracker": tracker_T.copy(),
+                        "orientation_idx": orientation_idx,
+                    }]
+                    self.get_logger().info(
+                        f"  Accumulated cloud updated for {bone_id}: "
+                        f"{len(pts)} denoised pts at orientation {orientation_idx+1}"
+                    )
 
             # ── ICP Registration ──
             icp_results = {}
