@@ -41,6 +41,13 @@ Usage:
     weights:=~/weights/best.pt \
     load_waypoints:=~/scan_output/waypoints.npy
 
+  # Enable perpendicular camera adjustment (reorients toward bone centroid using wrist joints)
+  ros2 launch scan_and_merge scan.launch.py \
+    run_detect:=true scan_node:=false \
+    perpendicular_adjust:=true \
+    weights:=~/weights/best.pt \
+    load_waypoints:=~/scan_output/waypoints.npy
+
 NOTE: The scan node needs interactive terminal input (ENTER to record / start).
       It launches in an xterm window. Install if you don't have it:
         sudo apt install xterm
@@ -107,6 +114,9 @@ def generate_launch_description():
     ref_to_tracker_tibia = LaunchConfiguration("ref_to_tracker_tibia")
     ref_to_tracker_femur = LaunchConfiguration("ref_to_tracker_femur")
 
+    # Perpendicular view adjustment
+    perpendicular_adjust = LaunchConfiguration("perpendicular_adjust")
+
     # Rosbag recording
     record_bag = LaunchConfiguration("record_bag")
     bag_dir    = LaunchConfiguration("bag_dir")
@@ -170,6 +180,11 @@ def generate_launch_description():
                               description="Enable multi-orientation ICP calibration mode"),
         DeclareLaunchArgument("n_orientations", default_value="2",
                               description="Number of bone orientations to collect"),
+
+        # ── Arguments: Perpendicular view adjustment ──
+        DeclareLaunchArgument("perpendicular_adjust", default_value="false",
+                              description="Reorient camera perpendicular to bone centroid at each waypoint "
+                                          "(uses top 2-3 wrist joints only)"),
 
         # ── Arguments: Rosbag recording ──
         DeclareLaunchArgument("record_bag", default_value="false",
@@ -277,6 +292,7 @@ def generate_launch_description():
                             "velocity_scaling": velocity_scaling,
                             "multi_orientation": multi_orientation,
                             "n_orientations": n_orientations,
+                            "perpendicular_adjust": perpendicular_adjust,
                         },
                     ],
                 ),
