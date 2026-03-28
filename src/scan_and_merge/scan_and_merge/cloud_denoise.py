@@ -288,6 +288,99 @@ def smooth_cloud(points, colors=None, k=10, iterations=1):
     return pts, colors
 
 
+def surface_smooth(points, colors=None,
+                   poisson_depth=8, poisson_density_quantile=0.1,
+                   taubin_iterations=10, taubin_lambda=0.5, taubin_mu=-0.53,
+                   resample_points=0):
+    """
+    Mesh-based surface smoothing:
+      1. Estimate normals
+      2. Poisson surface reconstruction → watertight mesh
+      3. Trim low-density faces (artifacts from sparse regions)
+      4. Taubin smoothing on the mesh (smooth WITHOUT shrinkage)
+      5. Sample points back from the smoothed mesh
+
+    Taubin smoothing alternates positive (λ) and negative (μ) Laplacian
+    steps, which cancels out the shrinkage that plain Laplacian causes.
+
+    Args:
+        points:                  (N, 3) array
+        colors:                  (N, 3) array or None
+        poisson_depth:           octree depth for Poisson recon (higher = finer detail,
+                                 8 is good for bone scans)
+        poisson_density_quantile: trim faces below this density quantile (0.0–1.0).
+                                  Higher = more aggressive trimming of sparse-region artifacts.
+        taubin_iterations:       number of Taubin smoothing passes on the mesh
+        taubin_lambda:           positive smoothing factor (shrink step)
+        taubin_mu:               negative smoothing factor (inflate step, must be < -λ)
+        resample_points:         number of points to sample from smoothed mesh.
+                                 0 = match input count.
+
+    Returns:
+        smoothed_points, smoothed_colors
+    """
+    if not HAS_OPEN3D or len(points) < 100:
+        print("[WARN] surface_smooth requires open3d and ≥100 points, skipping")
+        return points, colors
+
+    n_input = len(points)
+    n_target = resample_points if resample_points > 0 else n_input
+
+    # Build point cloud with normals
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    if colors is not None:
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    # Estimate normals (required for Poisson)
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.01, max_nn=30)
+    )
+    pcd.orient_normals_consistent_tangent_plane(k=15)
+
+    # Poisson surface reconstruction
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd, depth=poisson_depth, linear_fit=True
+    )
+
+    if len(mesh.vertices) == 0:
+        print("[WARN] Poisson reconstruction produced empty mesh, skipping surface smooth")
+        return points, colors
+
+    # Trim low-density vertices (removes bloated artifacts in sparse regions)
+    if poisson_density_quantile > 0:
+        densities = np.asarray(densities)
+        density_threshold = np.quantile(densities, poisson_density_quantile)
+        vertices_to_remove = densities < density_threshold
+        mesh.remove_vertices_by_mask(vertices_to_remove)
+
+    if len(mesh.triangles) == 0:
+        print("[WARN] Mesh empty after density trimming, skipping surface smooth")
+        return points, colors
+
+    # Taubin smoothing (smooth without shrinkage)
+    if taubin_iterations > 0:
+        mesh = mesh.filter_smooth_taubin(
+            number_of_iterations=taubin_iterations,
+            lambda_filter=taubin_lambda,
+            mu=taubin_mu,
+        )
+
+    # Sample points from the smoothed mesh
+    pcd_smooth = mesh.sample_points_uniformly(number_of_points=n_target)
+
+    smooth_pts = np.asarray(pcd_smooth.points)
+
+    # Transfer colors from original points via nearest-neighbor lookup
+    smooth_cols = None
+    if colors is not None and HAS_SCIPY:
+        tree = KDTree(points)
+        _, nn_idx = tree.query(smooth_pts)
+        smooth_cols = colors[nn_idx]
+
+    return smooth_pts, smooth_cols
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Full Pipeline
 # ──────────────────────────────────────────────────────────────────────
@@ -296,6 +389,9 @@ def denoise_pipeline(points, colors=None,
                      radius=0.01, min_neighbors=5,
                      voxel_size=0.001,
                      smooth_k=10, smooth_iters=1,
+                     surface_smooth_enabled=True,
+                     poisson_depth=8, poisson_density_quantile=0.1,
+                     taubin_iterations=10, taubin_mu=-0.53,
                      verbose=True):
     """
     Full denoising pipeline for a single merged cloud:
@@ -303,6 +399,7 @@ def denoise_pipeline(points, colors=None,
       2. Radius outlier removal
       3. Voxel downsample
       4. Laplacian smoothing
+      5. Mesh-based surface smoothing (Poisson + Taubin)
 
     For cross-cloud consistency, call cross_cloud_consistency_filter()
     BEFORE merging, then pass the merged result here.
@@ -345,6 +442,21 @@ def denoise_pipeline(points, colors=None,
         if verbose:
             print(f"    Smooth (k={smooth_k}, iters={smooth_iters}): done")
 
+    # Step 5: Mesh-based surface smoothing (Poisson + Taubin)
+    if surface_smooth_enabled:
+        n_before = len(points)
+        points, colors = surface_smooth(
+            points, colors,
+            poisson_depth=poisson_depth,
+            poisson_density_quantile=poisson_density_quantile,
+            taubin_iterations=taubin_iterations,
+            taubin_mu=taubin_mu,
+        )
+        if verbose:
+            print(f"    Surface smooth (Poisson depth={poisson_depth}, "
+                  f"Taubin iters={taubin_iterations}): "
+                  f"{n_before} → {len(points)}")
+
     if verbose:
         print(f"  Denoise complete: {n_start} → {len(points)} points")
 
@@ -357,6 +469,9 @@ def denoise_per_bone_pipeline(waypoint_clouds,
                               radius=0.01, min_neighbors=5,
                               voxel_size=0.001,
                               smooth_k=10, smooth_iters=1,
+                              surface_smooth_enabled=True,
+                              poisson_depth=8, poisson_density_quantile=0.1,
+                              taubin_iterations=10, taubin_mu=-0.53,
                               verbose=True):
     """
     Full pipeline for the bone scanning workflow:
@@ -446,6 +561,11 @@ def denoise_per_bone_pipeline(waypoint_clouds,
             radius=radius, min_neighbors=min_neighbors,
             voxel_size=voxel_size,
             smooth_k=smooth_k, smooth_iters=smooth_iters,
+            surface_smooth_enabled=surface_smooth_enabled,
+            poisson_depth=poisson_depth,
+            poisson_density_quantile=poisson_density_quantile,
+            taubin_iterations=taubin_iterations,
+            taubin_mu=taubin_mu,
             verbose=verbose,
         )
 

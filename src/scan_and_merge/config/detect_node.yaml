@@ -2,7 +2,7 @@ detect_and_merge_node:
   ros__parameters:
 
     # ── Scan ──
-    load_waypoints: "~/scan_output/waypoints.npy"
+    load_waypoints: "~/scan_output/new_waypoints.npy"
     weights: "~/scan_output/best.pt"
     target_classes: ""            # comma-sep or JSON list, empty = all
     confidence: 0.8
@@ -22,22 +22,27 @@ detect_and_merge_node:
     denoise_voxel_size: 0.001     # meters
     smooth_k: 10
     smooth_iterations: 1
+    surface_smooth: false
+    poisson_depth: 5              # octree depth for Poisson recon (higher = finer)
+    poisson_density_quantile: 0.1 # trim sparse-region artifacts (0.0–1.0)
+    taubin_iterations: 5         # Taubin mesh smoothing passes
+    taubin_mu: -0.53              # Taubin inflate factor (must be < -0.5)
 
     # ── ICP Registration ──
     register: true
-    tibia_reference: "resource/tibia.ply"    # relative to package share, or absolute path
-    femur_reference: "resource/femur.ply"    # relative to package share, or absolute path
+    tibia_reference: "resource/tibia_new.ply"    # relative to package share, or absolute path
+    femur_reference: "resource/femur_new.ply"    # relative to package share, or absolute path
     icp_coarse_method: "fpfh"
     icp_voxel_size: 0.002
     # tibia_init_transform: "~/detect_output/tibia_icp_T_ref2base_20260227_202247.npy"
     # femur_init_transform: "~/detect_output/femur_icp_T_ref2base_20260227_202247.npy"
 
     # ── Multi-Orientation Calibration ──
-    multi_orientation: false
-    n_orientations: 3
+    multi_orientation: true
+    n_orientations: 4
     tracker_avg_samples: 50
 
     # ── Perpendicular View Adjustment ──
-    perpendicular_adjust: false     # enable camera reorientation at each waypoint
+    perpendicular_adjust: true     # enable camera reorientation at each waypoint
     perp_max_angle_deg: 25.0        # skip if required rotation exceeds this (degrees)
     perp_free_joints: 3             # number of wrist joints free to move (2 or 3: A5/A6 or A5/A6/A7)

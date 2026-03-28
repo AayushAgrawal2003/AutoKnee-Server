@@ -179,6 +179,12 @@ class DetectAndMergeNode(Node):
         self.declare_parameter("denoise_voxel_size", 0.001)  # meters
         self.declare_parameter("smooth_k", 10)
         self.declare_parameter("smooth_iterations", 1)
+        self.declare_parameter("icp_coarse_method", "hybrid")
+        self.declare_parameter("surface_smooth", True)
+        self.declare_parameter("poisson_depth", 8)
+        self.declare_parameter("poisson_density_quantile", 0.1)
+        self.declare_parameter("taubin_iterations", 10)
+        self.declare_parameter("taubin_mu", -0.53)
 
         # Registration params
         pkg_share = get_package_share_directory("scan_and_merge")
@@ -188,7 +194,6 @@ class DetectAndMergeNode(Node):
         self.declare_parameter("femur_reference",
             os.path.join(pkg_share, "resource", "femur.ply"))
 
-        self.declare_parameter("icp_coarse_method", "fpfh")
         self.declare_parameter("icp_voxel_size", 0.002)
 
         """
@@ -391,6 +396,11 @@ class DetectAndMergeNode(Node):
         self.denoise_voxel_size = self.get_parameter("denoise_voxel_size").get_parameter_value().double_value
         self.smooth_k = self.get_parameter("smooth_k").get_parameter_value().integer_value
         self.smooth_iters = self.get_parameter("smooth_iterations").get_parameter_value().integer_value
+        self.surface_smooth_enabled = self.get_parameter("surface_smooth").get_parameter_value().bool_value
+        self.poisson_depth = self.get_parameter("poisson_depth").get_parameter_value().integer_value
+        self.poisson_density_quantile = self.get_parameter("poisson_density_quantile").get_parameter_value().double_value
+        self.taubin_iterations = self.get_parameter("taubin_iterations").get_parameter_value().integer_value
+        self.taubin_mu = self.get_parameter("taubin_mu").get_parameter_value().double_value
 
         # Registration params
         self.do_register = self.get_parameter("register").get_parameter_value().bool_value
@@ -1564,7 +1574,9 @@ class DetectAndMergeNode(Node):
                 f"  SOR: k={self.sor_k}, std={self.sor_std}\n"
                 f"  Radius: r={self.radius_filter}m, min_n={self.radius_min_neighbors}\n"
                 f"  Voxel: {self.denoise_voxel_size*1000:.1f}mm\n"
-                f"  Smooth: k={self.smooth_k}, iters={self.smooth_iters}"
+                f"  Smooth: k={self.smooth_k}, iters={self.smooth_iters}\n"
+                f"  Surface smooth: {self.surface_smooth_enabled} "
+                f"(Poisson depth={self.poisson_depth}, Taubin iters={self.taubin_iterations})"
             )
 
             results = denoise_per_bone_pipeline(
@@ -1578,6 +1590,11 @@ class DetectAndMergeNode(Node):
                 voxel_size=self.denoise_voxel_size,
                 smooth_k=self.smooth_k,
                 smooth_iters=self.smooth_iters,
+                surface_smooth_enabled=self.surface_smooth_enabled,
+                poisson_depth=self.poisson_depth,
+                poisson_density_quantile=self.poisson_density_quantile,
+                taubin_iterations=self.taubin_iterations,
+                taubin_mu=self.taubin_mu,
                 verbose=True,
             )
 
