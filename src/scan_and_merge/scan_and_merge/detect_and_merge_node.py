@@ -225,10 +225,12 @@ class DetectAndMergeNode(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             reliability=ReliabilityPolicy.RELIABLE,
         )
-        self.pub_tibia_aligned = self.create_publisher(PointCloud2, "/registered/tibia", latch_qos)
-        self.pub_femur_aligned = self.create_publisher(PointCloud2, "/registered/femur", latch_qos)
-        self.pub_tibia_ref = self.create_publisher(PointCloud2, "/reference/tibia", latch_qos)
-        self.pub_femur_ref = self.create_publisher(PointCloud2, "/reference/femur", latch_qos)
+        # /bone_scan/*  — filtered+denoised camera scan clouds (what the robot saw)
+        self.pub_scan_tibia = self.create_publisher(PointCloud2, "/bone_scan/tibia", latch_qos)
+        self.pub_scan_femur = self.create_publisher(PointCloud2, "/bone_scan/femur", latch_qos)
+        # /bone_model/* — ICP-aligned reference PLY (model moved to match scan)
+        self.pub_model_tibia = self.create_publisher(PointCloud2, "/bone_model/tibia", latch_qos)
+        self.pub_model_femur = self.create_publisher(PointCloud2, "/bone_model/femur", latch_qos)
 
         # Messages to latch-publish (set after registration)
         self._registered_msgs = {}  # populated after ICP
@@ -240,9 +242,10 @@ class DetectAndMergeNode(Node):
         self._cal_pub_femur = self.create_publisher(
             Float64MultiArray, "/calibration/ref_to_tracker_femur", 10)
 
-        # Model-frame reference cloud publishers (for bone_cloud_mover calibrated tracking)
-        self.pub_tibia_ref_model = self.create_publisher(PointCloud2, "/reference_model/tibia", latch_qos)
-        self.pub_femur_ref_model = self.create_publisher(PointCloud2, "/reference_model/femur", latch_qos)
+        # /model_frame/* — reference PLY in its own model frame (bone_cloud_mover uses this
+        #                   + calibration to do live tracking)
+        self.pub_model_frame_tibia = self.create_publisher(PointCloud2, "/model_frame/tibia", latch_qos)
+        self.pub_model_frame_femur = self.create_publisher(PointCloud2, "/model_frame/femur", latch_qos)
 
         # ── Output dirs ──
         self.det_dir = os.path.join(OUTPUT_DIR, "detections")
@@ -806,11 +809,11 @@ class DetectAndMergeNode(Node):
                     ref_cols = np.asarray(ref_pcd.colors) if ref_pcd.has_colors() else None
 
                     # Publish model-frame points (bone_cloud_mover applies T_tracker @ T_cal)
-                    model_msg = numpy_to_pc2(ref_pts, ref_cols, "reference_model")
+                    model_msg = numpy_to_pc2(ref_pts, ref_cols, "model_frame")
                     if bone_name == "tibia":
-                        self.pub_tibia_ref_model.publish(model_msg)
+                        self.pub_model_frame_tibia.publish(model_msg)
                     else:
-                        self.pub_femur_ref_model.publish(model_msg)
+                        self.pub_model_frame_femur.publish(model_msg)
                     self.get_logger().info(
                         f"  Published model-frame reference ({len(ref_pts)} pts) for {bone_name}"
                     )
@@ -1431,28 +1434,28 @@ class DetectAndMergeNode(Node):
             ref_msg = numpy_to_pc2(aligned_ref_pts, aligned_ref_cols, frame_id)
 
             if bone_name == "tibia":
-                self._registered_msgs["tibia_aligned"] = scan_msg
-                self._registered_msgs["tibia_ref"] = ref_msg
+                self._registered_msgs["scan_tibia"] = scan_msg
+                self._registered_msgs["model_tibia"] = ref_msg
             else:
-                self._registered_msgs["femur_aligned"] = scan_msg
-                self._registered_msgs["femur_ref"] = ref_msg
+                self._registered_msgs["scan_femur"] = scan_msg
+                self._registered_msgs["model_femur"] = ref_msg
 
             self.get_logger().info(
-                f"  {bone_name}: publishing scan + ref in {frame_id}"
+                f"  {bone_name}: publishing /bone_scan + /bone_model in {frame_id}"
             )
 
     # ──────────────────────────────────────────────────────────────────
     # Periodic Publish (latch for RViz)
     # ──────────────────────────────────────────────────────────────────
     def _publish_registered(self):
-        """Publish registered clouds (one-shot, transient_local)."""
+        """Publish scan + ICP-model clouds (one-shot, transient_local)."""
         now = self.get_clock().now().to_msg()
 
         for key, pub in [
-            ("tibia_aligned", self.pub_tibia_aligned),
-            ("femur_aligned", self.pub_femur_aligned),
-            ("tibia_ref",     self.pub_tibia_ref),
-            ("femur_ref",     self.pub_femur_ref),
+            ("scan_tibia",  self.pub_scan_tibia),
+            ("scan_femur",  self.pub_scan_femur),
+            ("model_tibia", self.pub_model_tibia),
+            ("model_femur", self.pub_model_femur),
         ]:
             if key in self._registered_msgs:
                 msg = self._registered_msgs[key]
