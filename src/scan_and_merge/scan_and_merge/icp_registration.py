@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ICP Registration Utilities (improved)
+ICP Registration Utilities (v3 — robust coarse alignment)
 
 Aligns a reference PLY model onto a scanned point cloud.
 
@@ -10,22 +10,17 @@ Open3D ICP convention: source is transformed to align with target.
   register_bone(scan_pts_base, scan_cols, ref_ply_path)
     → returns aligned reference points in base frame
 
-Changes vs original:
-  1. Default coarse_method changed to "hybrid" — races PCA-flip-search,
-     centroid, and FPFH, picks best automatically.
-  2. Multi-scale ICP now uses Cauchy robust loss to handle partial overlap
-     (scan only covers one side of the bone, so ~30% of reference points
-     have no valid correspondence — Cauchy down-weights those outliers).
-  3. PCA coarse alignment with 4 axis-flip search resolves the eigenvector
-     sign ambiguity that caused "aligning to random surfaces".
-  4. 6-stage coarse-to-fine refinement (was 3 stages).
-  5. .ptp() replaced with .max() - .min() for NumPy 2.x compat.
-
-Backward compatible:  coarse_method="fpfh" and "centroid" still work.
+Key improvements over v2:
+  1. Auto-detects mm-vs-m scale mismatch and converts reference to meters.
+  2. Exhaustive rotation search: 24 axis-aligned rotations + 8 PCA sign
+     combos + FPFH, all scored with trimmed scan→ref distance (correct
+     metric for partial overlap where scan sees only one side of the bone).
+  3. Top candidates refined with quick ICP before selecting winner.
+  4. Multi-scale ICP has divergence guard — reverts if fitness drops.
+  5. Backward compatible: same register_bone() signature.
 """
 
 import numpy as np
-import copy as _copy
 
 try:
     import open3d as o3d
@@ -34,7 +29,7 @@ except ImportError:
 
 
 # ─────────────────────────────────────────────────────────────
-# I/O helpers (unchanged)
+# I/O helpers
 # ─────────────────────────────────────────────────────────────
 
 def load_reference_mesh(ply_path, n_sample_points=50000, voxel_size=0.001):
@@ -103,15 +98,10 @@ def register_bone(scan_points, scan_colors, reference_ply_path,
                             uses this as the ICP starting pose.
 
     Returns:
-        dict:
-            transform:          4x4 (ref model → base frame)
-            aligned_ref_points: (M, 3) reference in base frame
-            aligned_ref_colors: (M, 3) or None
-            scan_points:        (K, 3) scan in base frame (downsampled)
-            scan_colors:        (K, 3) or None
-            fitness, rmse
+        dict with transform, aligned_ref_points, aligned_ref_colors,
+        scan_points, scan_colors, fitness, rmse
     """
-    print(f"\n  ── ICP Registration ──")
+    print(f"\n  ── ICP Registration (v3) ──")
 
     # Load + prepare
     ref_pcd = load_reference_mesh(reference_ply_path, voxel_size=voxel_size)
@@ -120,16 +110,8 @@ def register_bone(scan_points, scan_colors, reference_ply_path,
     _print_cloud_stats("Scan (TARGET, fixed)", scan_pcd)
     _print_cloud_stats("Ref  (SOURCE, moved)", ref_pcd)
 
-    # Check scale compatibility
-    scan_pts = np.asarray(scan_pcd.points)
-    ref_pts = np.asarray(ref_pcd.points)
-    scan_extent = scan_pts.max(axis=0) - scan_pts.min(axis=0)
-    ref_extent  = ref_pts.max(axis=0) - ref_pts.min(axis=0)
-    scale_ratio = np.linalg.norm(ref_extent) / max(np.linalg.norm(scan_extent), 1e-6)
-    print(f"    Scale ratio (ref/scan): {scale_ratio:.3f}")
-    if scale_ratio > 5.0 or scale_ratio < 0.2:
-        print(f"    WARNING: scale mismatch! ref may be in mm vs scan in m. "
-              f"Ratio={scale_ratio:.1f}")
+    # ── Auto-scale: detect mm vs m mismatch and fix ──
+    ref_pcd = _auto_scale_reference(ref_pcd, scan_pcd)
 
     # ── Coarse alignment ──
     if init_transform is not None:
@@ -137,34 +119,32 @@ def register_bone(scan_points, scan_colors, reference_ply_path,
         coarse_T = init_transform.copy()
 
     elif coarse_method == "hybrid":
-        print("    Coarse: hybrid (PCA-flip-search + centroid + FPFH) ...")
-        coarse_T = _hybrid_coarse(ref_pcd, scan_pcd, voxel_size)
+        print("    Coarse: exhaustive rotation search ...")
+        coarse_T = _exhaustive_coarse(ref_pcd, scan_pcd, voxel_size)
 
     elif coarse_method == "fpfh":
         print("    Coarse: FPFH RANSAC...")
         coarse_T = _fpfh_registration(ref_pcd, scan_pcd, voxel_size * 2)
-
-        # Check if FPFH actually worked
         eval_result = o3d.pipelines.registration.evaluate_registration(
             ref_pcd, scan_pcd, voxel_size * 20, coarse_T
         )
         if eval_result.fitness < 0.1:
             print(f"    FPFH failed (fitness={eval_result.fitness:.4f}), "
-                  f"falling back to centroid alignment...")
-            coarse_T = _centroid_alignment(ref_pcd, scan_pcd)
+                  f"falling back to exhaustive search...")
+            coarse_T = _exhaustive_coarse(ref_pcd, scan_pcd, voxel_size)
 
     else:
         print("    Coarse: centroid alignment...")
         coarse_T = _centroid_alignment(ref_pcd, scan_pcd)
 
-    # Debug: where does coarse put the reference?
+    # Debug
     ref_coarse = o3d.geometry.PointCloud(ref_pcd)
     ref_coarse.transform(coarse_T)
     _print_cloud_stats("Ref after coarse", ref_coarse)
 
-    # ── Fine: multi-scale ICP with Cauchy robust loss ──
+    # ── Fine: multi-scale ICP with divergence guard ──
     print("    Fine: multi-scale point-to-plane ICP (Cauchy loss)...")
-    final_T = _multiscale_icp_cauchy(ref_pcd, scan_pcd, coarse_T, voxel_size)
+    final_T = _multiscale_icp_guarded(ref_pcd, scan_pcd, coarse_T, voxel_size)
 
     # Evaluate
     eval_r = o3d.pipelines.registration.evaluate_registration(
@@ -174,23 +154,7 @@ def register_bone(scan_points, scan_colors, reference_ply_path,
     rmse = eval_r.inlier_rmse
     print(f"    Final: fitness={fitness:.4f}, RMSE={rmse:.6f}")
 
-    # If ICP failed badly, retry with centroid (only if we didn't already try it)
-    if fitness < 0.3 and coarse_method != "hybrid" and init_transform is None:
-        print(f"    ICP fitness too low ({fitness:.4f}), retrying with centroid...")
-        coarse_T = _centroid_alignment(ref_pcd, scan_pcd)
-        retry_T = _multiscale_icp_cauchy(ref_pcd, scan_pcd, coarse_T, voxel_size)
-        retry_eval = o3d.pipelines.registration.evaluate_registration(
-            ref_pcd, scan_pcd, voxel_size * 10, retry_T
-        )
-        if retry_eval.fitness > fitness:
-            final_T = retry_T
-            fitness = retry_eval.fitness
-            rmse = retry_eval.inlier_rmse
-            print(f"    Retry improved: fitness={fitness:.4f}, RMSE={rmse:.6f}")
-        else:
-            print(f"    Retry did not improve, keeping original")
-
-    # Apply transform to reference → now in base frame
+    # Apply transform to reference
     aligned_ref = o3d.geometry.PointCloud(ref_pcd)
     aligned_ref.transform(final_T)
     _print_cloud_stats("Ref ALIGNED (in base frame)", aligned_ref)
@@ -209,7 +173,51 @@ def register_bone(scan_points, scan_colors, reference_ply_path,
 
 
 # ─────────────────────────────────────────────────────────────
-# Coarse alignment strategies
+# Auto-scale: detect and fix mm ↔ m mismatch
+# ─────────────────────────────────────────────────────────────
+
+def _auto_scale_reference(ref_pcd, scan_pcd):
+    """If reference is in mm and scan in m (or vice versa), rescale reference."""
+    ref_pts = np.asarray(ref_pcd.points)
+    scan_pts = np.asarray(scan_pcd.points)
+    ref_diag = np.linalg.norm(ref_pts.max(axis=0) - ref_pts.min(axis=0))
+    scan_diag = np.linalg.norm(scan_pts.max(axis=0) - scan_pts.min(axis=0))
+
+    ratio = ref_diag / max(scan_diag, 1e-9)
+    print(f"    Scale ratio (ref/scan): {ratio:.3f}")
+
+    if ratio > 100:
+        # Reference is in mm, scan is in m — scale ref down
+        scale = 1.0 / 1000.0
+        print(f"    AUTO-SCALE: ref appears to be in mm, converting to meters (÷1000)")
+    elif ratio < 0.01:
+        # Reference is in m, scan is in mm
+        scale = 1000.0
+        print(f"    AUTO-SCALE: ref appears to be in m, scan in mm (×1000)")
+    elif ratio > 5:
+        scale = 1.0 / ratio
+        print(f"    AUTO-SCALE: significant scale mismatch, rescaling ref by {scale:.4f}")
+    elif ratio < 0.2:
+        scale = 1.0 / ratio
+        print(f"    AUTO-SCALE: significant scale mismatch, rescaling ref by {scale:.4f}")
+    else:
+        return ref_pcd
+
+    # Scale the reference
+    pts_scaled = ref_pts * scale
+    new_pcd = o3d.geometry.PointCloud()
+    new_pcd.points = o3d.utility.Vector3dVector(pts_scaled)
+    if ref_pcd.has_colors():
+        new_pcd.colors = ref_pcd.colors
+    if ref_pcd.has_normals():
+        new_pcd.normals = ref_pcd.normals
+
+    _print_cloud_stats("Ref (after scale)", new_pcd)
+    return new_pcd
+
+
+# ─────────────────────────────────────────────────────────────
+# Coarse alignment: exhaustive rotation search
 # ─────────────────────────────────────────────────────────────
 
 def _centroid_alignment(source, target):
@@ -221,93 +229,250 @@ def _centroid_alignment(source, target):
     return T
 
 
-def _pca_alignment(source, target, flip_x=1, flip_y=1):
-    """PCA rotation+translation with configurable axis flips."""
+def _make_transform(R, src_centroid, tgt_centroid):
+    """Build 4x4 that rotates source about its centroid, then translates to target centroid."""
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = tgt_centroid - R @ src_centroid
+    return T
+
+
+def _generate_octahedral_rotations():
+    """Generate all 24 rotation matrices of the octahedral group.
+    These are all axis-aligned rotations (90° increments around x/y/z)."""
+    rots = []
+    # All signed permutations of identity axes
+    axes = [np.array([1, 0, 0]), np.array([0, 1, 0]), np.array([0, 0, 1])]
+    for i in range(3):
+        for si in [1, -1]:
+            for j in range(3):
+                if j == i:
+                    continue
+                for sj in [1, -1]:
+                    # third axis determined by cross product (right-hand rule)
+                    a = axes[i] * si
+                    b = axes[j] * sj
+                    c = np.cross(a, b)
+                    R = np.column_stack([a, b, c])
+                    if abs(np.linalg.det(R) - 1.0) < 0.01:
+                        rots.append(R)
+    return rots
+
+
+def _generate_pca_rotations(source, target):
+    """Generate rotation candidates from PCA with all 8 sign combos."""
     def _pca(pcd):
         pts = np.asarray(pcd.points)
         c = pts.mean(axis=0)
-        vals, vecs = np.linalg.eigh(np.cov((pts - c).T))
-        return c, vecs[:, np.argsort(vals)[::-1]]
+        cov = np.cov((pts - c).T)
+        vals, vecs = np.linalg.eigh(cov)
+        idx = np.argsort(vals)[::-1]
+        return c, vecs[:, idx]
 
     sc, sa = _pca(source)
     tc, ta = _pca(target)
 
-    sa[:, 0] *= flip_x
-    sa[:, 1] *= flip_y
-    sa[:, 2] = np.cross(sa[:, 0], sa[:, 1])
+    rotations = []
+    for fx in [1, -1]:
+        for fy in [1, -1]:
+            for fz in [1, -1]:
+                sa_flip = sa.copy()
+                sa_flip[:, 0] *= fx
+                sa_flip[:, 1] *= fy
+                sa_flip[:, 2] *= fz
+                # Ensure right-handedness
+                if np.linalg.det(sa_flip) < 0:
+                    sa_flip[:, 2] *= -1
+                R = ta @ np.linalg.inv(sa_flip)
+                # Only keep proper rotations
+                if abs(np.linalg.det(R) - 1.0) < 0.01:
+                    rotations.append(R)
+    return rotations
 
-    R = ta @ np.linalg.inv(sa)
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3] = tc - R @ sc
-    return T
+
+def _generate_so3_samples(n_divisions=3):
+    """Generate roughly uniform rotation samples on SO(3) using
+    Euler angle grid. n_divisions=3 → ~72 rotations."""
+    rots = []
+    step = np.pi / (2 * n_divisions)  # 30° for n_divisions=3
+    for alpha in np.arange(0, 2 * np.pi, step):
+        for beta in np.arange(0, np.pi + 1e-9, step):
+            for gamma in np.arange(0, 2 * np.pi, step):
+                # ZYZ Euler angles
+                ca, sa_ = np.cos(alpha), np.sin(alpha)
+                cb, sb = np.cos(beta), np.sin(beta)
+                cg, sg = np.cos(gamma), np.sin(gamma)
+                Rz1 = np.array([[ca, -sa_, 0], [sa_, ca, 0], [0, 0, 1]])
+                Ry = np.array([[cb, 0, sb], [0, 1, 0], [-sb, 0, cb]])
+                Rz2 = np.array([[cg, -sg, 0], [sg, cg, 0], [0, 0, 1]])
+                R = Rz1 @ Ry @ Rz2
+                rots.append(R)
+    return rots
 
 
-def _quick_evaluate(source, target, coarse_T):
-    """Quick 3-stage Cauchy ICP + Chamfer eval to score a coarse alignment."""
+def _score_alignment_trimmed(source_pts, target_tree, trim_pct=0.75):
+    """Score alignment using trimmed scan→source distance.
+
+    For partial overlap: every SCAN point should have a nearby REF point.
+    We measure target→source distance (how well the scan is covered by ref),
+    and take the trimmed mean to ignore the worst outliers.
+
+    Lower is better.
+    """
+    # target_tree is built from scan. source_pts is transformed ref.
+    # We want: for each scan point, distance to nearest ref point.
+    # So build tree from source_pts (ref), query with target (scan).
+    source_pcd = o3d.geometry.PointCloud()
+    source_pcd.points = o3d.utility.Vector3dVector(source_pts)
+    # distances from scan to nearest ref
+    dists = np.asarray(target_tree.compute_point_cloud_distance(source_pcd))
+
+    # But we actually want ref→scan coverage too for the visible part.
+    # Better: use scan→ref (each scan point should have a close ref point)
+    dists_scan_to_ref = np.asarray(
+        o3d.geometry.PointCloud(o3d.utility.Vector3dVector(
+            np.asarray(target_tree.points)
+        )).compute_point_cloud_distance(source_pcd)
+    )
+
+    # Trimmed mean of scan→ref distances
+    n = len(dists_scan_to_ref)
+    k = max(1, int(n * trim_pct))
+    sorted_d = np.sort(dists_scan_to_ref)
+    return np.mean(sorted_d[:k])
+
+
+def _score_transform_fast(ref_pts, scan_pcd, T, trim_pct=0.75):
+    """Apply transform to ref_pts, score against scan using trimmed scan→ref."""
+    R = T[:3, :3]
+    t = T[:3, 3]
+    ref_transformed = (R @ ref_pts.T).T + t
+
+    ref_pcd = o3d.geometry.PointCloud()
+    ref_pcd.points = o3d.utility.Vector3dVector(ref_transformed)
+
+    # For each scan point, find distance to nearest transformed ref point
+    scan_pts = np.asarray(scan_pcd.points)
+    dists = np.asarray(scan_pcd.compute_point_cloud_distance(ref_pcd))
+
+    n = len(dists)
+    k = max(1, int(n * trim_pct))
+    return np.mean(np.sort(dists)[:k])
+
+
+def _quick_icp_refine(source, target, init_T, max_dists=[0.03, 0.01, 0.005]):
+    """Quick 3-stage Cauchy ICP to refine a coarse alignment. Returns (T, score)."""
     s_tmp = o3d.geometry.PointCloud(source)
-    s_tmp.transform(coarse_T)
+    s_tmp.transform(init_T)
     s_tmp.estimate_normals(
         o3d.geometry.KDTreeSearchParamHybrid(radius=0.005, max_nn=30))
 
-    cT = np.eye(4)
-    for md in [0.03, 0.01, 0.005]:
+    current_T = np.eye(4)
+    best_fitness = 0.0
+    for md in max_dists:
         loss = o3d.pipelines.registration.CauchyLoss(k=md * 0.3)
         r = o3d.pipelines.registration.registration_icp(
-            s_tmp, target, md, cT,
+            s_tmp, target, md, current_T,
             o3d.pipelines.registration.TransformationEstimationPointToPlane(loss),
-            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=150))
-        cT = r.transformation
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=100))
+        current_T = r.transformation
+        best_fitness = max(best_fitness, r.fitness)
 
-    s_eval = o3d.geometry.PointCloud(s_tmp)
-    s_eval.transform(cT)
-    d_fwd = np.asarray(s_eval.compute_point_cloud_distance(target))
-    d_rev = np.asarray(target.compute_point_cloud_distance(s_eval))
-    return np.mean(d_fwd) + np.mean(d_rev)
+    # Compose: final_T = current_T @ init_T
+    composed_T = current_T @ init_T
+
+    # Score: trimmed scan→ref distance
+    ref_transformed = np.asarray(o3d.geometry.PointCloud(source).transform(composed_T).points)
+    ref_pcd_t = o3d.geometry.PointCloud()
+    ref_pcd_t.points = o3d.utility.Vector3dVector(ref_transformed)
+    dists = np.asarray(target.compute_point_cloud_distance(ref_pcd_t))
+    n = len(dists)
+    k = max(1, int(n * 0.75))
+    score = np.mean(np.sort(dists)[:k])
+
+    return composed_T, score
 
 
-def _hybrid_coarse(source, target, voxel_size):
+def _exhaustive_coarse(source, target, voxel_size):
     """
-    Race multiple coarse strategies, each followed by a quick Cauchy ICP,
-    and return the one with the lowest Chamfer distance.
+    Exhaustive rotation search for coarse alignment.
 
-    Strategies:
-      A) PCA with 4 axis-flip combos  (handles orientation ambiguity)
-      B) Centroid translation          (fast fallback)
-      C) FPFH RANSAC                   (feature-based)
+    Generates rotation candidates from:
+      A) All 24 axis-aligned rotations (octahedral group)
+      B) PCA with 8 sign combos (4 unique proper rotations)
+      C) FPFH RANSAC
+    Scores each with trimmed scan→ref distance, refines top candidates
+    with quick ICP, returns the best.
     """
-    candidates = []
+    src_pts = np.asarray(source.points)
+    src_c = src_pts.mean(axis=0)
+    tgt_c = np.asarray(target.points).mean(axis=0)
 
-    # A: PCA flips (4 combos)
-    for fx in [1, -1]:
-        for fy in [1, -1]:
-            T = _pca_alignment(source, target, fx, fy)
-            chamfer = _quick_evaluate(source, target, T)
-            candidates.append((chamfer, T, f"PCA({fx},{fy})"))
+    # ── Generate all candidate transforms ──
+    candidates = []  # (score, T, label)
 
-    # B: Centroid
+    # A: 24 axis-aligned rotations
+    oct_rots = _generate_octahedral_rotations()
+    for i, R in enumerate(oct_rots):
+        T = _make_transform(R, src_c, tgt_c)
+        score = _score_transform_fast(src_pts, target, T)
+        candidates.append((score, T, f"Oct-{i}"))
+
+    # B: PCA rotations (up to 8 sign combos → ~4 proper rotations)
+    pca_rots = _generate_pca_rotations(source, target)
+    for i, R in enumerate(pca_rots):
+        T = _make_transform(R, src_c, tgt_c)
+        score = _score_transform_fast(src_pts, target, T)
+        candidates.append((score, T, f"PCA-{i}"))
+
+    # C: Centroid-only (identity rotation)
     T_c = _centroid_alignment(source, target)
-    chamfer = _quick_evaluate(source, target, T_c)
-    candidates.append((chamfer, T_c, "Centroid"))
+    score = _score_transform_fast(src_pts, target, T_c)
+    candidates.append((score, T_c, "Centroid"))
 
-    # C: FPFH
+    # D: FPFH RANSAC
     try:
         T_f = _fpfh_registration(source, target, voxel_size * 2)
-        chamfer = _quick_evaluate(source, target, T_f)
-        candidates.append((chamfer, T_f, "FPFH"))
+        score = _score_transform_fast(src_pts, target, T_f)
+        candidates.append((score, T_f, "FPFH"))
     except Exception as e:
         print(f"      FPFH failed: {e}")
 
+    # E: Fast Global Registration
+    try:
+        T_fgr = _fgr_registration(source, target, voxel_size * 2)
+        score = _score_transform_fast(src_pts, target, T_fgr)
+        candidates.append((score, T_fgr, "FGR"))
+    except Exception as e:
+        print(f"      FGR failed: {e}")
+
+    # Sort by score and take top candidates for ICP refinement
     candidates.sort(key=lambda x: x[0])
-    best_chamfer, best_T, best_label = candidates[0]
 
-    print(f"    Hybrid coarse candidates:")
-    for ch, _, lab in candidates[:5]:
-        marker = " ◀ winner" if lab == best_label else ""
-        print(f"      {lab}: chamfer={ch:.6f}{marker}")
+    print(f"    Pre-ICP ranking (top 8 of {len(candidates)}):")
+    for sc, _, lab in candidates[:8]:
+        print(f"      {lab}: trimmed_dist={sc:.6f}")
 
-    return best_T
+    # ── Refine top candidates with quick ICP ──
+    n_refine = min(8, len(candidates))
+    refined = []
+    for sc, T, lab in candidates[:n_refine]:
+        T_ref, icp_score = _quick_icp_refine(source, target, T)
+        refined.append((icp_score, T_ref, lab))
 
+    refined.sort(key=lambda x: x[0])
+
+    print(f"    Post-ICP ranking (top 5):")
+    for sc, _, lab in refined[:5]:
+        marker = " ◀ winner" if lab == refined[0][2] else ""
+        print(f"      {lab}: trimmed_dist={sc:.6f}{marker}")
+
+    return refined[0][1]
+
+
+# ─────────────────────────────────────────────────────────────
+# Feature-based coarse registration
+# ─────────────────────────────────────────────────────────────
 
 def _fpfh_registration(source, target, voxel_size):
     """FPFH + RANSAC coarse registration. source→target."""
@@ -318,10 +483,10 @@ def _fpfh_registration(source, target, voxel_size):
     tgt_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
         target, o3d.geometry.KDTreeSearchParamHybrid(radius=r_feat, max_nn=100))
 
-    dist_thresh = voxel_size * 1.5
+    dist_thresh = voxel_size * 3.0
     result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
         source, target, src_fpfh, tgt_fpfh,
-        mutual_filter=True,
+        mutual_filter=False,  # don't require mutual — partial overlap breaks this
         max_correspondence_distance=dist_thresh,
         estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
         ransac_n=3,
@@ -329,33 +494,61 @@ def _fpfh_registration(source, target, voxel_size):
             o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
             o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(dist_thresh),
         ],
-        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 0.999),
+        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(200000, 0.999),
     )
     print(f"      FPFH RANSAC: fitness={result.fitness:.4f}, RMSE={result.inlier_rmse:.6f}")
     return result.transformation
 
 
+def _fgr_registration(source, target, voxel_size):
+    """Fast Global Registration — often better than RANSAC for partial overlap."""
+    r_feat = voxel_size * 5
+
+    src_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+        source, o3d.geometry.KDTreeSearchParamHybrid(radius=r_feat, max_nn=100))
+    tgt_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+        target, o3d.geometry.KDTreeSearchParamHybrid(radius=r_feat, max_nn=100))
+
+    result = o3d.pipelines.registration.registration_fgr_based_on_feature_matching(
+        source, target, src_fpfh, tgt_fpfh,
+        o3d.pipelines.registration.FastGlobalRegistrationOption(
+            maximum_correspondence_distance=voxel_size * 3.0,
+        ),
+    )
+    print(f"      FGR: fitness={result.fitness:.4f}, RMSE={result.inlier_rmse:.6f}")
+    return result.transformation
+
+
 # ─────────────────────────────────────────────────────────────
-# Fine alignment: multi-scale ICP with Cauchy robust loss
+# Fine alignment: multi-scale ICP with divergence guard
 # ─────────────────────────────────────────────────────────────
 
-def _multiscale_icp_cauchy(source, target, init_T, voxel_size):
+def _multiscale_icp_guarded(source, target, init_T, voxel_size):
     """
-    6-stage coarse-to-fine ICP with Cauchy loss.
+    6-stage coarse-to-fine ICP with Cauchy loss and transform-based
+    divergence detection.
 
-    The Cauchy kernel down-weights outlier correspondences, which is
-    critical when the reference model extends beyond the partial scan.
+    Instead of comparing fitness across stages (which naturally drops at
+    tighter thresholds with partial overlap), we detect divergence by
+    checking if the transform jumps too far between stages.
     """
     max_dists = [
-        voxel_size * 25,   # 50 mm — capture gross misalignment
+        voxel_size * 25,   # 50 mm
         voxel_size * 15,   # 30 mm
         voxel_size * 10,   # 20 mm
         voxel_size * 5,    # 10 mm
         voxel_size * 2.5,  #  5 mm
-        voxel_size * 1,    #  2 mm — fine polish
+        voxel_size * 1,    #  2 mm
     ]
 
+    # Fixed evaluation threshold for consistent scoring
+    eval_dist = voxel_size * 10
+
     current_T = init_T.copy()
+    best_T = init_T.copy()
+    best_eval = o3d.pipelines.registration.evaluate_registration(
+        source, target, eval_dist, init_T)
+    best_score = best_eval.fitness
 
     for i, md in enumerate(max_dists):
         vs = max(md * 0.3, voxel_size)
@@ -379,8 +572,70 @@ def _multiscale_icp_cauchy(source, target, init_T, voxel_size):
                 relative_rmse=1e-7,
             ),
         )
-        current_T = result.transformation
-        print(f"      Scale {i+1} (dist={md*1000:.1f}mm): "
-              f"fitness={result.fitness:.4f}, RMSE={result.inlier_rmse:.6f}")
 
-    return current_T
+        # Evaluate at fixed threshold for consistent scoring
+        new_eval = o3d.pipelines.registration.evaluate_registration(
+            source, target, eval_dist, result.transformation)
+
+        print(f"      Scale {i+1} (dist={md*1000:.1f}mm): "
+              f"fitness={result.fitness:.4f}, RMSE={result.inlier_rmse:.6f} "
+              f"[eval@{eval_dist*1000:.0f}mm: {new_eval.fitness:.4f}]")
+
+        # Check for divergence: large rotation jump from current best
+        R_diff = result.transformation[:3, :3] @ np.linalg.inv(current_T[:3, :3])
+        angle_jump = np.degrees(np.arccos(
+            np.clip((np.trace(R_diff) - 1) / 2, -1, 1)))
+
+        if angle_jump > 45 and best_score > 0.3:
+            print(f"      ⚠ Large rotation jump ({angle_jump:.1f}°), reverting")
+            current_T = best_T.copy()
+            continue
+
+        # Accept if evaluation score improved or didn't drop badly
+        if new_eval.fitness >= best_score * 0.85:
+            current_T = result.transformation
+            if new_eval.fitness >= best_score:
+                best_score = new_eval.fitness
+                best_T = result.transformation.copy()
+        else:
+            print(f"      ⚠ Eval fitness dropped ({new_eval.fitness:.4f} < "
+                  f"{best_score*0.85:.4f}), reverting")
+            current_T = best_T.copy()
+
+    return best_T
+
+
+# ─────────────────────────────────────────────────────────────
+# Legacy aliases for backward compatibility
+# ─────────────────────────────────────────────────────────────
+
+def _hybrid_coarse(source, target, voxel_size):
+    """Legacy wrapper — calls exhaustive search."""
+    return _exhaustive_coarse(source, target, voxel_size)
+
+
+def _pca_alignment(source, target, flip_x=1, flip_y=1):
+    """Legacy PCA alignment with configurable axis flips."""
+    def _pca(pcd):
+        pts = np.asarray(pcd.points)
+        c = pts.mean(axis=0)
+        vals, vecs = np.linalg.eigh(np.cov((pts - c).T))
+        return c, vecs[:, np.argsort(vals)[::-1]]
+
+    sc, sa = _pca(source)
+    tc, ta = _pca(target)
+
+    sa[:, 0] *= flip_x
+    sa[:, 1] *= flip_y
+    sa[:, 2] = np.cross(sa[:, 0], sa[:, 1])
+
+    R = ta @ np.linalg.inv(sa)
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = tc - R @ sc
+    return T
+
+
+def _multiscale_icp_cauchy(source, target, init_T, voxel_size):
+    """Legacy alias for guarded ICP."""
+    return _multiscale_icp_guarded(source, target, init_T, voxel_size)

@@ -164,9 +164,10 @@ class DetectAndMergeNode(Node):
                               ))
         self.declare_parameter("confidence", 0.5)
         self.declare_parameter("velocity_scaling", VELOCITY_SCALING)
+        self.get_logger().info(f"velocity_scalling {VELOCITY_SCALING}")
         self.declare_parameter("max_depth_m", MAX_DEPTH_M)
         self.declare_parameter("settle_time", SETTLE_TIME)
-        self.declare_parameter("use_seg_mask", False)
+        self.declare_parameter("use_seg_mask", True)
 
         # Denoise params
         self.declare_parameter("denoise", True)
@@ -213,12 +214,12 @@ class DetectAndMergeNode(Node):
         # self.declare_parameter("femur_init_transform", "~/detect_output/femur_icp_T_ref2base_20260227_202247.npy")  # path to .npy 4x4
 
         # Multi-orientation calibration params
-        self.declare_parameter("multi_orientation", False)
-        self.declare_parameter("n_orientations", 3)
+        self.declare_parameter("multi_orientation", True)
+        self.declare_parameter("n_orientations", 4)
         self.declare_parameter("tracker_avg_samples", 50)
 
         # Perpendicular view adjustment params
-        self.declare_parameter("perpendicular_adjust", False)
+        self.declare_parameter("perpendicular_adjust", True)
         self.declare_parameter("perp_max_angle_deg", 25.0)
         self.declare_parameter("perp_free_joints", 3)  # 2 or 3 free joints from the wrist end
 

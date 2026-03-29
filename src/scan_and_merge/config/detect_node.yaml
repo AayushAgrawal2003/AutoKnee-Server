@@ -6,7 +6,7 @@ detect_and_merge_node:
     weights: "~/scan_output/best.pt"
     target_classes: ""            # comma-sep or JSON list, empty = all
     confidence: 0.8
-    velocity_scaling: 0.5
+    velocity_scaling: 0.1
     max_depth_m: 1.0
     settle_time: 1.5
     use_seg_mask: true
@@ -32,10 +32,10 @@ detect_and_merge_node:
     register: true
     tibia_reference: "resource/tibia_new.ply"    # relative to package share, or absolute path
     femur_reference: "resource/femur_new.ply"    # relative to package share, or absolute path
-    icp_coarse_method: "fpfh"
+    icp_coarse_method: "hybrid"
     icp_voxel_size: 0.002
-    # tibia_init_transform: "~/detect_output/tibia_icp_T_ref2base_20260227_202247.npy"
-    # femur_init_transform: "~/detect_output/femur_icp_T_ref2base_20260227_202247.npy"
+    # tibia_init_transform: "~/scan_output/tibia_icp_T_ref2base_20260328_154540.npy"
+    # femur_init_transform: "~/scan_output/femur_icp_T_ref2base_20260328_154540.npy"
 
     # ── Multi-Orientation Calibration ──
     multi_orientation: true

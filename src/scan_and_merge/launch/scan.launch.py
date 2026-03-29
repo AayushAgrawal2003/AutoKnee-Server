@@ -138,7 +138,7 @@ def generate_launch_description():
                               description="Camera yaw from lbr_link_7 (radians)"),
 
         # ── Arguments: Scan node ──
-        DeclareLaunchArgument("load_waypoints", default_value="~/scan_output/waypoints.npy",
+        DeclareLaunchArgument("load_waypoints", default_value="~/scan_output/new_waypoints.npy",
                               description="Path to waypoints.npy"),
         DeclareLaunchArgument("velocity_scaling", default_value="0.1",
                               description="Robot velocity scaling 0.0-1.0"),
@@ -178,11 +178,11 @@ def generate_launch_description():
         # ── Arguments: Multi-orientation calibration ──
         DeclareLaunchArgument("multi_orientation", default_value="true",
                               description="Enable multi-orientation ICP calibration mode"),
-        DeclareLaunchArgument("n_orientations", default_value="2",
+        DeclareLaunchArgument("n_orientations", default_value="4",
                               description="Number of bone orientations to collect"),
 
         # ── Arguments: Perpendicular view adjustment ──
-        DeclareLaunchArgument("perpendicular_adjust", default_value="false",
+        DeclareLaunchArgument("perpendicular_adjust", default_value="true",
                               description="Reorient camera perpendicular to bone centroid at each waypoint "
                                           "(uses top 2-3 wrist joints only)"),
 
