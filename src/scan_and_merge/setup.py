@@ -32,6 +32,7 @@ setup(
             "waypoint_visualizer = scan_and_merge.waypoint_visualizer:main",
             "ee_publisher = scan_and_merge.marker_pub:main",
             "bone_cloud_mover = scan_and_merge.bone_cloud_mover:main",
+            "goto_pose_node = scan_and_merge.goto_pose_node:main",
         ],
     },
 )

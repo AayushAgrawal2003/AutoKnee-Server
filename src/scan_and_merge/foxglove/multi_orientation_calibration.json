@@ -85,6 +85,18 @@
           "visible": false,
           "colorMode": "rgb",
           "pointSize": 1
+        },
+        "/goal_pose_input": {
+          "visible": true,
+          "color": "#ff00ff",
+          "axisScale": 0.12,
+          "type": "axis"
+        },
+        "/goto_pose/target": {
+          "visible": true,
+          "color": "#00ffff",
+          "axisScale": 0.1,
+          "type": "axis"
         }
       },
       "layers": {
@@ -175,6 +187,24 @@
       "value": "{ \"data\": \"solve\" }"
     },
 
+    "Publish!goto_pose_go": {
+      "topicName": "/goto_pose/command",
+      "datatype": "std_msgs/msg/String",
+      "buttonText": "Go To Target Pose",
+      "buttonTooltip": "Move the end effector to the received goal pose",
+      "buttonColor": "#9b59b6",
+      "advancedView": false,
+      "value": "{ \"data\": \"go\" }"
+    },
+    "RawMessages!goto_status": {
+      "topicPath": "/goto_pose/status.data",
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "fontSize": 14
+    },
+
     "Image!cam1": {
       "imageTopic": "/camera_arm/camera/color/image_rect_raw",
       "calibrationTopic": "",
@@ -194,7 +224,7 @@
     "Log!log1": {
       "searchTerms": [],
       "minLogLevel": 1,
-      "nameFilter": { "detect_and_merge_node": "match", "bone_cloud_mover": "match" }
+      "nameFilter": { "detect_and_merge_node": "match", "bone_cloud_mover": "match", "goto_pose_node": "match" }
     }
   },
 
@@ -241,9 +271,19 @@
         },
         "second": {
           "direction": "column",
-          "splitPercentage": 60,
-          "first": "Image!cam1",
-          "second": "Log!log1"
+          "splitPercentage": 15,
+          "first": {
+            "direction": "row",
+            "splitPercentage": 40,
+            "first": "Publish!goto_pose_go",
+            "second": "RawMessages!goto_status"
+          },
+          "second": {
+            "direction": "column",
+            "splitPercentage": 55,
+            "first": "Image!cam1",
+            "second": "Log!log1"
+          }
         }
       }
     }
