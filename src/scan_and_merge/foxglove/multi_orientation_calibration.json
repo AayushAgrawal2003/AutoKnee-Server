@@ -97,6 +97,12 @@
           "color": "#00ffff",
           "axisScale": 0.1,
           "type": "axis"
+        },
+        "/goto_pose/ee_target": {
+          "visible": true,
+          "color": "#ff0000",
+          "axisScale": 0.08,
+          "type": "axis"
         }
       },
       "layers": {

@@ -208,6 +208,7 @@ class GoToPoseNode(Node):
             reliability=ReliabilityPolicy.RELIABLE,
         )
         self.target_pub = self.create_publisher(PoseStamped, "/goto_pose/target", latch_qos)
+        self.ee_target_pub = self.create_publisher(PoseStamped, "/goto_pose/ee_target", latch_qos)
         self.status_pub = self.create_publisher(String, "/goto_pose/status", 10)
 
         # MoveIt2 action client
@@ -343,6 +344,10 @@ class GoToPoseNode(Node):
         ps.pose.orientation.z = float(ee_quat[2])
         ps.pose.orientation.w = float(ee_quat[3])
         ik_req.ik_request.pose_stamped = ps
+
+        # Publish the computed EE target pose for visualization
+        self.ee_target_pub.publish(ps)
+        self.get_logger().info("Published computed EE target to /goto_pose/ee_target")
 
         self.get_logger().info(
             f"IK request pose in {BASE_FRAME}:\n"
