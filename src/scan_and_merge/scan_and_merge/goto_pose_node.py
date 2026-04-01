@@ -170,7 +170,7 @@ class GoToPoseNode(Node):
         super().__init__("goto_pose_node")
         self.get_logger().info("GoToPose Node starting...")
 
-        self.declare_parameter("input_topic", "/goal_pose_input")
+        self.declare_parameter("input_topic", "/surgical_plan/prob_pose")
         self.declare_parameter("velocity_scaling", VELOCITY_SCALING)
 
         self.input_topic = self.get_parameter("input_topic").get_parameter_value().string_value

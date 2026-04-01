@@ -86,7 +86,7 @@
           "colorMode": "rgb",
           "pointSize": 1
         },
-        "/goal_pose_input": {
+        "/surgical_plan/prob_pose": {
           "visible": true,
           "color": "#ff00ff",
           "axisScale": 0.12,
