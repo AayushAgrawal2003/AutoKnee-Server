@@ -30,8 +30,10 @@ detect_and_merge_node:
 
     # ── ICP Registration ──
     register: true
-    tibia_reference: "resource/tibia_new.ply"    # relative to package share, or absolute path
-    femur_reference: "resource/femur_new.ply"    # relative to package share, or absolute path
+    tibia_reference: "resource/tibia_new.ply"    # for alignment (relative to package share, or absolute path)
+    femur_reference: "resource/femur_new.ply"    # for alignment
+    tibia_vis_reference: "resource/tibia.ply"    # for visualization/publishing
+    femur_vis_reference: "resource/femur.ply"    # for visualization/publishing
     icp_coarse_method: "hybrid"
     icp_voxel_size: 0.002
     # tibia_init_transform: "~/scan_output/tibia_icp_T_ref2base_20260328_154540.npy"

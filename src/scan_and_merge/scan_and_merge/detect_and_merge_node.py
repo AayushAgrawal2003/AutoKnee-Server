@@ -194,6 +194,11 @@ class DetectAndMergeNode(Node):
             os.path.join(pkg_share, "resource", "tibia.ply"))
         self.declare_parameter("femur_reference",
             os.path.join(pkg_share, "resource", "femur.ply"))
+        # Visualization references (used for publishing, while _reference files are used for ICP alignment)
+        self.declare_parameter("tibia_vis_reference",
+            os.path.join(pkg_share, "resource", "tibia.ply"))
+        self.declare_parameter("femur_vis_reference",
+            os.path.join(pkg_share, "resource", "femur.ply"))
 
         self.declare_parameter("icp_voxel_size", 0.002)
 
@@ -410,6 +415,11 @@ class DetectAndMergeNode(Node):
             self.get_parameter("tibia_reference").get_parameter_value().string_value, pkg_share)
         self.femur_ref_path = self._resolve_ref_path(
             self.get_parameter("femur_reference").get_parameter_value().string_value, pkg_share)
+        # Visualization references (for publishing)
+        self.tibia_vis_path = self._resolve_ref_path(
+            self.get_parameter("tibia_vis_reference").get_parameter_value().string_value, pkg_share)
+        self.femur_vis_path = self._resolve_ref_path(
+            self.get_parameter("femur_vis_reference").get_parameter_value().string_value, pkg_share)
         self.icp_coarse = self.get_parameter("icp_coarse_method").get_parameter_value().string_value
         self.icp_voxel = self.get_parameter("icp_voxel_size").get_parameter_value().double_value
         self.tibia_init_T_path = os.path.expanduser(
@@ -886,26 +896,27 @@ class DetectAndMergeNode(Node):
             }
 
             # Publish model-frame reference points for bone_cloud_mover
-            ref_path = self.tibia_ref_path if bone_name == "tibia" else self.femur_ref_path
-            if ref_path and os.path.exists(ref_path):
+            # Use vis reference for publishing (better for visualization)
+            vis_path = self.tibia_vis_path if bone_name == "tibia" else self.femur_vis_path
+            if vis_path and os.path.exists(vis_path):
                 try:
                     from scan_and_merge.icp_registration import load_reference_mesh
-                    ref_pcd = load_reference_mesh(ref_path, voxel_size=self.icp_voxel)
-                    ref_pts = np.asarray(ref_pcd.points)
-                    ref_cols = np.asarray(ref_pcd.colors) if ref_pcd.has_colors() else None
+                    vis_pcd = load_reference_mesh(vis_path, voxel_size=self.icp_voxel)
+                    vis_pts = np.asarray(vis_pcd.points)
+                    vis_cols = np.asarray(vis_pcd.colors) if vis_pcd.has_colors() else None
 
                     # Publish model-frame points (bone_cloud_mover applies T_tracker @ T_cal)
-                    model_msg = numpy_to_pc2(ref_pts, ref_cols, "model_frame")
+                    model_msg = numpy_to_pc2(vis_pts, vis_cols, "model_frame")
                     if bone_name == "tibia":
                         self.pub_model_frame_tibia.publish(model_msg)
                     else:
                         self.pub_model_frame_femur.publish(model_msg)
                     self.get_logger().info(
-                        f"  Published model-frame reference ({len(ref_pts)} pts) for {bone_name}"
+                        f"  Published model-frame vis reference ({len(vis_pts)} pts) for {bone_name}"
                     )
                 except Exception as e:
                     self.get_logger().error(
-                        f"  Failed to publish model reference for {bone_name}: {e}"
+                        f"  Failed to publish model vis reference for {bone_name}: {e}"
                     )
 
         # Save report
@@ -1786,9 +1797,29 @@ class DetectAndMergeNode(Node):
                 o3d.io.write_point_cloud(ref_path_out, pcd)
                 self.get_logger().info(f"  Saved: {ref_path_out}")
 
+            # Load vis reference and apply same transform for publishing
+            vis_path = self.tibia_vis_path if bone_name == "tibia" else self.femur_vis_path
+            aligned_vis_pts = aligned_ref_pts  # fallback to alignment mesh
+            aligned_vis_cols = aligned_ref_cols
+            if vis_path and os.path.exists(vis_path):
+                try:
+                    from scan_and_merge.icp_registration import load_reference_mesh
+                    vis_pcd = load_reference_mesh(vis_path, voxel_size=self.icp_voxel)
+                    # Apply same transform to vis mesh
+                    vis_pcd.transform(T_ref_to_base)
+                    aligned_vis_pts = np.asarray(vis_pcd.points)
+                    aligned_vis_cols = np.asarray(vis_pcd.colors) if vis_pcd.has_colors() else None
+                    self.get_logger().info(
+                        f"  Using vis reference for {bone_name} publishing ({len(aligned_vis_pts)} pts)"
+                    )
+                except Exception as e:
+                    self.get_logger().warn(
+                        f"  Failed to load vis reference for {bone_name}, using alignment mesh: {e}"
+                    )
+
             # PointCloud2 messages — all in lbr_link_0
             scan_msg = numpy_to_pc2(scan_pts, scan_cols, frame_id)
-            ref_msg = numpy_to_pc2(aligned_ref_pts, aligned_ref_cols, frame_id)
+            ref_msg = numpy_to_pc2(aligned_vis_pts, aligned_vis_cols, frame_id)
 
             if bone_name == "tibia":
                 self._registered_msgs["scan_tibia"] = scan_msg
