@@ -101,7 +101,7 @@ def rotation_matrix_to_quat(R):
     return np.array([x, y, z, w])
 
 
-def compute_opposite_z_orientation(goal_quat):
+def compute_opposite_z_orientation(goal_quat, logger=None):
     """
     Compute an orientation where the EE z-axis is parallel but opposite
     to the goal pose z-axis.
@@ -116,23 +116,51 @@ def compute_opposite_z_orientation(goal_quat):
     # EE z-axis should point opposite to goal z-axis
     z_ee = -z_goal
 
-    # Choose x-axis: use world x if not parallel, otherwise use world y
+    if logger:
+        logger.info(f"  Goal z-axis: [{z_goal[0]:.3f}, {z_goal[1]:.3f}, {z_goal[2]:.3f}]")
+        logger.info(f"  EE z-axis (opposite): [{z_ee[0]:.3f}, {z_ee[1]:.3f}, {z_ee[2]:.3f}]")
+
+    # Choose a reference "up" vector that is NOT parallel to z_ee
+    world_z = np.array([0.0, 0.0, 1.0])
     world_x = np.array([1.0, 0.0, 0.0])
-    world_y = np.array([0.0, 1.0, 0.0])
 
-    if abs(np.dot(z_ee, world_x)) < 0.9:
-        x_ee = np.cross(world_y, z_ee)
+    # Use world_z as "up" unless z_ee is nearly vertical
+    if abs(np.dot(z_ee, world_z)) < 0.9:
+        # z_ee is not vertical, use world_z to derive x
+        # x = (up) x z_ee, then normalize
+        x_ee = np.cross(world_z, z_ee)
     else:
-        x_ee = np.cross(z_ee, world_y)
+        # z_ee is nearly vertical, use world_x instead
+        x_ee = np.cross(world_x, z_ee)
 
-    x_ee = x_ee / np.linalg.norm(x_ee)
+    x_norm = np.linalg.norm(x_ee)
+    if x_norm < 1e-6:
+        # Fallback: use world_x
+        x_ee = np.cross(np.array([0.0, 1.0, 0.0]), z_ee)
+        x_norm = np.linalg.norm(x_ee)
 
-    # y-axis completes right-handed system
+    x_ee = x_ee / x_norm
+
+    # y-axis completes right-handed system: y = z x x
     y_ee = np.cross(z_ee, x_ee)
     y_ee = y_ee / np.linalg.norm(y_ee)
 
-    # Build rotation matrix
+    # Build rotation matrix [x, y, z]
     R_ee = np.column_stack([x_ee, y_ee, z_ee])
+
+    # Verify it's a proper rotation matrix
+    det = np.linalg.det(R_ee)
+    if logger:
+        logger.info(f"  Rotation matrix det: {det:.6f} (should be 1.0)")
+
+    if abs(det - 1.0) > 0.01:
+        if logger:
+            logger.warn(f"  WARNING: Rotation matrix is not proper! det={det}")
+        # Try to fix by flipping x
+        x_ee = -x_ee
+        y_ee = np.cross(z_ee, x_ee)
+        y_ee = y_ee / np.linalg.norm(y_ee)
+        R_ee = np.column_stack([x_ee, y_ee, z_ee])
 
     return rotation_matrix_to_quat(R_ee)
 
@@ -251,14 +279,12 @@ class GoToPoseNode(Node):
             goal_pose.pose.orientation.w,
         ])
 
-        ee_quat = compute_opposite_z_orientation(goal_quat)
+        self.get_logger().info(f"Goal position: {goal_pos}")
+        self.get_logger().info(f"Goal quaternion: {goal_quat}")
 
-        self.get_logger().info(
-            f"Goal position: {goal_pos}"
-        )
-        self.get_logger().info(
-            f"EE orientation (z opposite to goal z): {ee_quat}"
-        )
+        ee_quat = compute_opposite_z_orientation(goal_quat, logger=self.get_logger())
+
+        self.get_logger().info(f"EE quaternion (z opposite to goal z): {ee_quat}")
 
         # Transform goal to base frame if needed
         goal_frame = goal_pose.header.frame_id
@@ -318,6 +344,12 @@ class GoToPoseNode(Node):
         ps.pose.orientation.w = float(ee_quat[3])
         ik_req.ik_request.pose_stamped = ps
 
+        self.get_logger().info(
+            f"IK request pose in {BASE_FRAME}:\n"
+            f"  position: [{goal_pos[0]:.4f}, {goal_pos[1]:.4f}, {goal_pos[2]:.4f}]\n"
+            f"  orientation: [{ee_quat[0]:.4f}, {ee_quat[1]:.4f}, {ee_quat[2]:.4f}, {ee_quat[3]:.4f}]"
+        )
+
         # Seed state
         from sensor_msgs.msg import JointState as SensorJointState
         seed_js = SensorJointState()
@@ -333,7 +365,22 @@ class GoToPoseNode(Node):
 
         if ik_result is None or ik_result.error_code.val != 1:
             ec = ik_result.error_code.val if ik_result else "timeout"
-            self._publish_status(f"IK failed (error={ec})")
+            # Common error codes: -31 = NO_IK_SOLUTION, -12 = INVALID_GOAL_CONSTRAINTS
+            error_names = {
+                -31: "NO_IK_SOLUTION (pose may be unreachable)",
+                -12: "INVALID_GOAL_CONSTRAINTS",
+                -10: "START_STATE_IN_COLLISION",
+                -4: "PLANNING_FAILED",
+            }
+            error_msg = error_names.get(ec, f"error code {ec}")
+            self._publish_status(f"IK failed: {error_msg}")
+            self.get_logger().error(
+                f"IK failed with error {ec}. The requested pose may be:\n"
+                f"  - Outside robot workspace\n"
+                f"  - In collision\n"
+                f"  - Requiring joint limits to be exceeded\n"
+                f"Try a different goal pose or orientation."
+            )
             return
 
         # Extract solved joint positions
