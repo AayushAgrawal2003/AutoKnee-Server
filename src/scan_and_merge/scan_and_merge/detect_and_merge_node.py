@@ -48,6 +48,9 @@ from moveit_msgs.msg import (
     Constraints,
     JointConstraint,
 )
+from moveit_msgs.srv import GetPositionIK
+from moveit_msgs.msg import PositionIKRequest, RobotState as MoveItRobotState
+from geometry_msgs.msg import PoseStamped as GeomPoseStamped
 
 import numpy as np
 import threading
@@ -81,7 +84,7 @@ from scan_and_merge.icp_registration import register_bone
 from scan_and_merge.multi_orientation_solver import solve_with_outlier_rejection
 from scan_and_merge.mo_utils import (
     quat_to_rotation_matrix, numpy_to_pc2,
-    parse_target_classes, MultiOrientHelper,
+    parse_target_classes, MultiOrientHelper, invert_transform,
 )
 
 
@@ -109,6 +112,41 @@ PLANNING_TIME = 10.0
 MAX_DEPTH_M = 1.0
 
 OUTPUT_DIR = os.path.expanduser("~/detect_output")
+EE_LINK = f"{ROBOT_NAME}_link_ee"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────
+
+def _rot_to_quat(R):
+    """Convert a 3x3 rotation matrix to a quaternion [x, y, z, w]."""
+    trace = R[0, 0] + R[1, 1] + R[2, 2]
+    if trace > 0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (R[2, 1] - R[1, 2]) * s
+        y = (R[0, 2] - R[2, 0]) * s
+        z = (R[1, 0] - R[0, 1]) * s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+    return np.array([x, y, z, w])
 
 
 class DetectAndMergeNode(Node):
@@ -126,9 +164,10 @@ class DetectAndMergeNode(Node):
                               ))
         self.declare_parameter("confidence", 0.5)
         self.declare_parameter("velocity_scaling", VELOCITY_SCALING)
+        self.get_logger().info(f"velocity_scalling {VELOCITY_SCALING}")
         self.declare_parameter("max_depth_m", MAX_DEPTH_M)
         self.declare_parameter("settle_time", SETTLE_TIME)
-        self.declare_parameter("use_seg_mask", False)
+        self.declare_parameter("use_seg_mask", True)
 
         # Denoise params
         self.declare_parameter("denoise", True)
@@ -141,14 +180,26 @@ class DetectAndMergeNode(Node):
         self.declare_parameter("denoise_voxel_size", 0.001)  # meters
         self.declare_parameter("smooth_k", 10)
         self.declare_parameter("smooth_iterations", 1)
+        self.declare_parameter("icp_coarse_method", "hybrid")
+        self.declare_parameter("surface_smooth", True)
+        self.declare_parameter("poisson_depth", 8)
+        self.declare_parameter("poisson_density_quantile", 0.1)
+        self.declare_parameter("taubin_iterations", 10)
+        self.declare_parameter("taubin_mu", -0.53)
 
         # Registration params
         pkg_share = get_package_share_directory("scan_and_merge")
         self.declare_parameter("register", True)
         self.declare_parameter("tibia_reference",
             os.path.join(pkg_share, "resource", "tibia.ply"))
+        self.declare_parameter("femur_reference",
+            os.path.join(pkg_share, "resource", "femur.ply"))
+        # Visualization references (used for publishing, while _reference files are used for ICP alignment)
+        self.declare_parameter("tibia_vis_reference",
+            os.path.join(pkg_share, "resource", "tibia.ply"))
+        self.declare_parameter("femur_vis_reference",
+            os.path.join(pkg_share, "resource", "femur.ply"))
 
-        self.declare_parameter("icp_coarse_method", "fpfh")
         self.declare_parameter("icp_voxel_size", 0.002)
 
         """
@@ -168,9 +219,14 @@ class DetectAndMergeNode(Node):
         # self.declare_parameter("femur_init_transform", "~/detect_output/femur_icp_T_ref2base_20260227_202247.npy")  # path to .npy 4x4
 
         # Multi-orientation calibration params
-        self.declare_parameter("multi_orientation", False)
-        self.declare_parameter("n_orientations", 3)
+        self.declare_parameter("multi_orientation", True)
+        self.declare_parameter("n_orientations", 4)
         self.declare_parameter("tracker_avg_samples", 50)
+
+        # Perpendicular view adjustment params
+        self.declare_parameter("perpendicular_adjust", True)
+        self.declare_parameter("perp_max_angle_deg", 25.0)
+        self.declare_parameter("perp_free_joints", 3)  # 2 or 3 free joints from the wrist end
 
         self.cb_group = ReentrantCallbackGroup()
 
@@ -218,6 +274,13 @@ class DetectAndMergeNode(Node):
             self, MoveGroup, "/lbr/move_action",
             callback_group=self.cb_group,
         )
+        # IK service — used by perpendicular view adjustment to pre-compute
+        # exact joint targets before planning (avoids OrientationConstraint
+        # sampling failures with OMPL)
+        self._ik_client = self.create_client(
+            GetPositionIK, "/lbr/compute_ik",
+            callback_group=self.cb_group,
+        )
 
         # ── PointCloud2 Publishers (transient_local so bone_cloud_mover can latch) ──
         latch_qos = QoSProfile(
@@ -225,10 +288,12 @@ class DetectAndMergeNode(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             reliability=ReliabilityPolicy.RELIABLE,
         )
-        self.pub_tibia_aligned = self.create_publisher(PointCloud2, "/registered/tibia", latch_qos)
-        self.pub_femur_aligned = self.create_publisher(PointCloud2, "/registered/femur", latch_qos)
-        self.pub_tibia_ref = self.create_publisher(PointCloud2, "/reference/tibia", latch_qos)
-        self.pub_femur_ref = self.create_publisher(PointCloud2, "/reference/femur", latch_qos)
+        # /bone_scan/*  — filtered+denoised camera scan clouds (what the robot saw)
+        self.pub_scan_tibia = self.create_publisher(PointCloud2, "/bone_scan/tibia", latch_qos)
+        self.pub_scan_femur = self.create_publisher(PointCloud2, "/bone_scan/femur", latch_qos)
+        # /bone_model/* — ICP-aligned reference PLY (model moved to match scan)
+        self.pub_model_tibia = self.create_publisher(PointCloud2, "/bone_model/tibia", latch_qos)
+        self.pub_model_femur = self.create_publisher(PointCloud2, "/bone_model/femur", latch_qos)
 
         # Messages to latch-publish (set after registration)
         self._registered_msgs = {}  # populated after ICP
@@ -240,9 +305,10 @@ class DetectAndMergeNode(Node):
         self._cal_pub_femur = self.create_publisher(
             Float64MultiArray, "/calibration/ref_to_tracker_femur", 10)
 
-        # Model-frame reference cloud publishers (for bone_cloud_mover calibrated tracking)
-        self.pub_tibia_ref_model = self.create_publisher(PointCloud2, "/reference_model/tibia", latch_qos)
-        self.pub_femur_ref_model = self.create_publisher(PointCloud2, "/reference_model/femur", latch_qos)
+        # /model_frame/* — reference PLY in its own model frame (bone_cloud_mover uses this
+        #                   + calibration to do live tracking)
+        self.pub_model_frame_tibia = self.create_publisher(PointCloud2, "/model_frame/tibia", latch_qos)
+        self.pub_model_frame_femur = self.create_publisher(PointCloud2, "/model_frame/femur", latch_qos)
 
         # ── Output dirs ──
         self.det_dir = os.path.join(OUTPUT_DIR, "detections")
@@ -336,6 +402,11 @@ class DetectAndMergeNode(Node):
         self.denoise_voxel_size = self.get_parameter("denoise_voxel_size").get_parameter_value().double_value
         self.smooth_k = self.get_parameter("smooth_k").get_parameter_value().integer_value
         self.smooth_iters = self.get_parameter("smooth_iterations").get_parameter_value().integer_value
+        self.surface_smooth_enabled = self.get_parameter("surface_smooth").get_parameter_value().bool_value
+        self.poisson_depth = self.get_parameter("poisson_depth").get_parameter_value().integer_value
+        self.poisson_density_quantile = self.get_parameter("poisson_density_quantile").get_parameter_value().double_value
+        self.taubin_iterations = self.get_parameter("taubin_iterations").get_parameter_value().integer_value
+        self.taubin_mu = self.get_parameter("taubin_mu").get_parameter_value().double_value
 
         # Registration params
         self.do_register = self.get_parameter("register").get_parameter_value().bool_value
@@ -344,6 +415,11 @@ class DetectAndMergeNode(Node):
             self.get_parameter("tibia_reference").get_parameter_value().string_value, pkg_share)
         self.femur_ref_path = self._resolve_ref_path(
             self.get_parameter("femur_reference").get_parameter_value().string_value, pkg_share)
+        # Visualization references (for publishing)
+        self.tibia_vis_path = self._resolve_ref_path(
+            self.get_parameter("tibia_vis_reference").get_parameter_value().string_value, pkg_share)
+        self.femur_vis_path = self._resolve_ref_path(
+            self.get_parameter("femur_vis_reference").get_parameter_value().string_value, pkg_share)
         self.icp_coarse = self.get_parameter("icp_coarse_method").get_parameter_value().string_value
         self.icp_voxel = self.get_parameter("icp_voxel_size").get_parameter_value().double_value
         self.tibia_init_T_path = os.path.expanduser(
@@ -357,6 +433,11 @@ class DetectAndMergeNode(Node):
         self.multi_orientation = self.get_parameter("multi_orientation").get_parameter_value().bool_value
         self.n_orientations = self.get_parameter("n_orientations").get_parameter_value().integer_value
         self.tracker_avg_samples = self.get_parameter("tracker_avg_samples").get_parameter_value().integer_value
+
+        # Perpendicular view adjustment params
+        self.perpendicular_adjust = self.get_parameter("perpendicular_adjust").get_parameter_value().bool_value
+        self.perp_max_angle_deg = self.get_parameter("perp_max_angle_deg").get_parameter_value().double_value
+        self.perp_free_joints = self.get_parameter("perp_free_joints").get_parameter_value().integer_value
 
         # ── Parse target classes ──
         self.target_classes = parse_target_classes(target_cls_str)
@@ -443,6 +524,15 @@ class DetectAndMergeNode(Node):
             )
             time.sleep(self.settle_time)
 
+            # After first detection, reorient camera perpendicular to bone centroid
+            if self.perpendicular_adjust and self.waypoint_clouds:
+                adjusted = self._adjust_view_perpendicular(velocity)
+                if adjusted:
+                    self.get_logger().info(
+                        f"  Settling {self.settle_time:.1f}s after adjustment..."
+                    )
+                    time.sleep(self.settle_time)
+
             rot, trans = self._capture_current_transform()
             self._detect_and_capture(i, rot, trans)
 
@@ -509,6 +599,13 @@ class DetectAndMergeNode(Node):
             "femur": [],
         }
 
+        # Accumulated denoised clouds per bone across orientations.
+        # Each entry: {"points_base": (N,3), "colors": (N,3)|None,
+        #              "T_tracker": 4x4, "orientation_idx": int}
+        # After each orientation we REPLACE with the single merged result,
+        # so at most one entry per bone at any time.
+        accumulated_clouds = {"bone_left": [], "bone_right": []}
+
         self._publish_mo_status(
             f"MULTI-ORIENTATION MODE: {self.n_orientations} orientations planned. "
             f"Commands: publish to /multi_orient/command"
@@ -562,8 +659,47 @@ class DetectAndMergeNode(Node):
                 self.get_logger().info(f"  Settling {self.settle_time:.1f}s...")
                 time.sleep(self.settle_time)
 
+                # After first detection, reorient camera perpendicular to bone centroid
+                if self.perpendicular_adjust and self.waypoint_clouds:
+                    adjusted = self._adjust_view_perpendicular(velocity)
+                    if adjusted:
+                        self.get_logger().info(
+                            f"  Settling {self.settle_time:.1f}s after adjustment..."
+                        )
+                        time.sleep(self.settle_time)
+
                 rot, trans = self._capture_current_transform()
                 self._detect_and_capture(i, rot, trans)
+
+            # ── Inject accumulated clouds from prior orientations ──
+            if orientation_idx > 0:
+                bone_tracker_pairs = [
+                    ("bone_left", T_tracker_tibia),
+                    ("bone_right", T_tracker_femur),
+                ]
+                for bone_id, current_T_tracker in bone_tracker_pairs:
+                    if current_T_tracker is None:
+                        continue
+                    for prev in accumulated_clouds[bone_id]:
+                        # T_delta moves points from old bone position to current
+                        T_delta = current_T_tracker @ invert_transform(prev["T_tracker"])
+                        old_pts = prev["points_base"]
+                        transformed = (T_delta[:3, :3] @ old_pts.T).T + T_delta[:3, 3]
+                        # Inject as synthetic waypoint entry (identity TF — already in base)
+                        self.waypoint_clouds.append({
+                            "label": f"accum_ori{prev['orientation_idx']}_{bone_id}",
+                            "bone_id": bone_id,
+                            "class_name": "accumulated",
+                            "wp_idx": -1,
+                            "points_cam": transformed,
+                            "colors": prev["colors"],
+                            "rotation": np.eye(3),
+                            "translation": np.zeros(3),
+                        })
+                        self.get_logger().info(
+                            f"  Injected {len(old_pts)} accumulated pts for {bone_id} "
+                            f"from orientation {prev['orientation_idx']+1}"
+                        )
 
             # ── Merge + denoise ──
             if self.waypoint_clouds:
@@ -575,6 +711,25 @@ class DetectAndMergeNode(Node):
                 self._merge_clouds()
             else:
                 self.get_logger().warn("No clouds to merge for this orientation!")
+
+            # ── Update accumulated clouds with merged+denoised result ──
+            # Replace prior accumulated entries with the single combined cloud
+            # (which now includes old accumulated + new scan data, all denoised).
+            for bone_id, tracker_T in [("bone_left", T_tracker_tibia),
+                                        ("bone_right", T_tracker_femur)]:
+                if bone_id in self.denoise_results and tracker_T is not None:
+                    pts = self.denoise_results[bone_id]["points"]
+                    cols = self.denoise_results[bone_id]["colors"]
+                    accumulated_clouds[bone_id] = [{
+                        "points_base": pts.copy(),
+                        "colors": cols.copy() if cols is not None else None,
+                        "T_tracker": tracker_T.copy(),
+                        "orientation_idx": orientation_idx,
+                    }]
+                    self.get_logger().info(
+                        f"  Accumulated cloud updated for {bone_id}: "
+                        f"{len(pts)} denoised pts at orientation {orientation_idx+1}"
+                    )
 
             # ── ICP Registration ──
             icp_results = {}
@@ -741,26 +896,27 @@ class DetectAndMergeNode(Node):
             }
 
             # Publish model-frame reference points for bone_cloud_mover
-            ref_path = self.tibia_ref_path if bone_name == "tibia" else self.femur_ref_path
-            if ref_path and os.path.exists(ref_path):
+            # Use vis reference for publishing (better for visualization)
+            vis_path = self.tibia_vis_path if bone_name == "tibia" else self.femur_vis_path
+            if vis_path and os.path.exists(vis_path):
                 try:
                     from scan_and_merge.icp_registration import load_reference_mesh
-                    ref_pcd = load_reference_mesh(ref_path, voxel_size=self.icp_voxel)
-                    ref_pts = np.asarray(ref_pcd.points)
-                    ref_cols = np.asarray(ref_pcd.colors) if ref_pcd.has_colors() else None
+                    vis_pcd = load_reference_mesh(vis_path, voxel_size=self.icp_voxel)
+                    vis_pts = np.asarray(vis_pcd.points)
+                    vis_cols = np.asarray(vis_pcd.colors) if vis_pcd.has_colors() else None
 
                     # Publish model-frame points (bone_cloud_mover applies T_tracker @ T_cal)
-                    model_msg = numpy_to_pc2(ref_pts, ref_cols, "reference_model")
+                    model_msg = numpy_to_pc2(vis_pts, vis_cols, "model_frame")
                     if bone_name == "tibia":
-                        self.pub_tibia_ref_model.publish(model_msg)
+                        self.pub_model_frame_tibia.publish(model_msg)
                     else:
-                        self.pub_femur_ref_model.publish(model_msg)
+                        self.pub_model_frame_femur.publish(model_msg)
                     self.get_logger().info(
-                        f"  Published model-frame reference ({len(ref_pts)} pts) for {bone_name}"
+                        f"  Published model-frame vis reference ({len(vis_pts)} pts) for {bone_name}"
                     )
                 except Exception as e:
                     self.get_logger().error(
-                        f"  Failed to publish model reference for {bone_name}: {e}"
+                        f"  Failed to publish model vis reference for {bone_name}: {e}"
                     )
 
         # Save report
@@ -1099,6 +1255,270 @@ class DetectAndMergeNode(Node):
             return False
 
     # ──────────────────────────────────────────────────────────────────
+    # Perpendicular View Adjustment
+    # ──────────────────────────────────────────────────────────────────
+    def _adjust_view_perpendicular(self, velocity) -> bool:
+        """
+        Reorient the camera to look perpendicularly toward the centroid of all
+        currently accumulated bone scan points.
+
+        Strategy: compute the desired EE orientation, call MoveIt's IK service
+        (/lbr/compute_ik) to get exact joint angles, then plan with pure
+        JointConstraints.  This avoids OrientationConstraints which OMPL cannot
+        reliably sample (error 99999).
+
+        Only the top `perp_free_joints` wrist joints (A5–A7) are free; proximal
+        joints A1 through (7 - perp_free_joints) are locked at their current
+        values in the IK seed and in the resulting joint goal.
+
+        Skips silently if:
+          - no accumulated clouds are available yet
+          - the required angle delta is < 1° (already aligned)
+          - the required angle delta is > perp_max_angle_deg (would move too much)
+          - any TF lookup, IK, or MoveIt call fails
+        """
+        if not self.waypoint_clouds:
+            return False
+
+        # ── Compute bone centroid in base frame ──
+        all_pts = []
+        for entry in self.waypoint_clouds:
+            pts = entry["points_cam"]
+            rot = entry["rotation"]
+            trans = entry["translation"]
+            if len(pts) == 0:
+                continue
+            pts_base = (rot @ pts.T).T + trans
+            all_pts.append(pts_base)
+
+        if not all_pts:
+            return False
+
+        centroid = np.mean(np.vstack(all_pts), axis=0)
+
+        # ── Get current camera pose from TF ──
+        try:
+            tf_cam = self.tf_buffer.lookup_transform(
+                BASE_FRAME, CAMERA_FRAME,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=2.0),
+            )
+            cam_trans = np.array([
+                tf_cam.transform.translation.x,
+                tf_cam.transform.translation.y,
+                tf_cam.transform.translation.z,
+            ])
+            cam_quat = np.array([
+                tf_cam.transform.rotation.x,
+                tf_cam.transform.rotation.y,
+                tf_cam.transform.rotation.z,
+                tf_cam.transform.rotation.w,
+            ])
+            R_cam = quat_to_rotation_matrix(cam_quat)
+        except Exception as e:
+            self.get_logger().warn(f"  [perp_adjust] Camera TF lookup failed: {e}")
+            return False
+
+        # ── Get current EE pose from TF ──
+        try:
+            tf_ee = self.tf_buffer.lookup_transform(
+                BASE_FRAME, EE_LINK,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=2.0),
+            )
+            ee_quat = np.array([
+                tf_ee.transform.rotation.x,
+                tf_ee.transform.rotation.y,
+                tf_ee.transform.rotation.z,
+                tf_ee.transform.rotation.w,
+            ])
+            R_ee = quat_to_rotation_matrix(ee_quat)
+        except Exception as e:
+            self.get_logger().warn(f"  [perp_adjust] EE TF lookup failed: {e}")
+            return False
+
+        # ── Compute desired camera z-axis (pointing toward centroid) ──
+        direction = centroid - cam_trans
+        dist = np.linalg.norm(direction)
+        if dist < 0.01:
+            self.get_logger().warn(
+                "  [perp_adjust] Centroid too close to camera, skipping."
+            )
+            return False
+
+        z_new = direction / dist
+
+        # ── Check angle between current and desired optical axis ──
+        z_current = R_cam[:, 2]
+        cos_angle = float(np.clip(np.dot(z_current, z_new), -1.0, 1.0))
+        angle_deg = float(np.degrees(np.arccos(cos_angle)))
+
+        if angle_deg < 1.0:
+            self.get_logger().info(
+                f"  [perp_adjust] Already aligned ({angle_deg:.1f}°), skipping."
+            )
+            return False
+
+        if angle_deg > self.perp_max_angle_deg:
+            self.get_logger().warn(
+                f"  [perp_adjust] Required rotation {angle_deg:.1f}° > "
+                f"max {self.perp_max_angle_deg:.1f}°, skipping."
+            )
+            return False
+
+        # ── Build new camera rotation matrix ──
+        # Keep current camera y as "up" reference
+        y_ref = R_cam[:, 1]
+        y_new = y_ref - np.dot(y_ref, z_new) * z_new
+        if np.linalg.norm(y_new) < 1e-6:
+            # Degenerate: camera y is parallel to z_new — use world z instead
+            fallback = np.array([0.0, 0.0, 1.0])
+            y_new = fallback - np.dot(fallback, z_new) * z_new
+        y_new = y_new / np.linalg.norm(y_new)
+        x_new = np.cross(y_new, z_new)
+        x_new = x_new / np.linalg.norm(x_new)
+        R_cam_new = np.column_stack([x_new, y_new, z_new])
+
+        # Propagate rotation delta to end-effector
+        R_delta = R_cam_new @ R_cam.T
+        R_ee_new = R_delta @ R_ee
+        q_ee_new = _rot_to_quat(R_ee_new)
+
+        # ── Get current joint positions ──
+        js = self.latest_joint_state
+        if js is None:
+            self.get_logger().warn("  [perp_adjust] No joint state available, skipping.")
+            return False
+        joint_map = dict(zip(js.name, js.position))
+
+        # Number of proximal joints to lock
+        n_locked = max(0, len(JOINT_NAMES) - max(2, min(3, self.perp_free_joints)))
+
+        # ── Call IK service to get joint angles for desired EE orientation ──
+        # Build seed: current joint positions (A1-A4 locked, A5-A7 free to vary)
+        if not self._ik_client.wait_for_service(timeout_sec=3.0):
+            self.get_logger().warn("  [perp_adjust] IK service not available, skipping.")
+            return False
+
+        ik_req = GetPositionIK.Request()
+        ik_req.ik_request.group_name = PLANNING_GROUP
+        ik_req.ik_request.avoid_collisions = True
+        ik_req.ik_request.timeout.sec = 5
+
+        # Desired EE pose: keep current position, use new orientation
+        ps = GeomPoseStamped()
+        ps.header.frame_id = BASE_FRAME
+        ps.header.stamp = self.get_clock().now().to_msg()
+        ps.pose.position.x = tf_ee.transform.translation.x
+        ps.pose.position.y = tf_ee.transform.translation.y
+        ps.pose.position.z = tf_ee.transform.translation.z
+        ps.pose.orientation.x = float(q_ee_new[0])
+        ps.pose.orientation.y = float(q_ee_new[1])
+        ps.pose.orientation.z = float(q_ee_new[2])
+        ps.pose.orientation.w = float(q_ee_new[3])
+        ik_req.ik_request.pose_stamped = ps
+
+        # Seed state: current joints — keeps A1-A4 anchored so IK
+        # naturally finds a solution near the current wrist configuration
+        from sensor_msgs.msg import JointState as SensorJointState
+        seed_js = SensorJointState()
+        seed_js.name = JOINT_NAMES
+        seed_js.position = [float(joint_map.get(j, 0.0)) for j in JOINT_NAMES]
+        ik_req.ik_request.robot_state.joint_state = seed_js
+
+        ik_future = self._ik_client.call_async(ik_req)
+        rclpy.spin_until_future_complete(self, ik_future, timeout_sec=10.0)
+        ik_result = ik_future.result()
+
+        if ik_result is None or ik_result.error_code.val != 1:
+            ec = ik_result.error_code.val if ik_result else "timeout"
+            self.get_logger().warn(
+                f"  [perp_adjust] IK failed (error={ec}), skipping adjustment."
+            )
+            return False
+
+        # Extract solved joint positions
+        ik_joint_map = dict(
+            zip(ik_result.solution.joint_state.name,
+                ik_result.solution.joint_state.position)
+        )
+
+        # Verify the wrist actually moved — if IK returned same config, skip
+        wrist_delta = max(
+            abs(ik_joint_map.get(j, joint_map.get(j, 0.0)) - joint_map.get(j, 0.0))
+            for j in JOINT_NAMES[n_locked:]
+        )
+        if wrist_delta < 1e-4:
+            self.get_logger().info(
+                "  [perp_adjust] IK returned identical config, skipping."
+            )
+            return False
+
+        self.get_logger().info(
+            f"  [perp_adjust] IK solved — rotating camera {angle_deg:.1f}° → "
+            f"centroid [{centroid[0]:.3f}, {centroid[1]:.3f}, {centroid[2]:.3f}] "
+            f"(locking {n_locked}/{len(JOINT_NAMES)} joints, "
+            f"free: {JOINT_NAMES[n_locked:]})"
+        )
+
+        # ── Build MoveIt goal with pure JointConstraints ──
+        # Pure joint-space goals are trivial for OMPL — no sampling on manifolds.
+        goal_constraints = Constraints()
+        for jname in JOINT_NAMES:
+            # Use IK-solved value for free joints, current value for locked joints
+            if jname in JOINT_NAMES[:n_locked]:
+                jval = joint_map.get(jname, 0.0)
+                tol = 0.005   # tight lock
+            else:
+                jval = ik_joint_map.get(jname, joint_map.get(jname, 0.0))
+                tol = 0.01    # normal goal tolerance
+
+            jc = JointConstraint()
+            jc.joint_name = jname
+            jc.position = float(jval)
+            jc.tolerance_above = tol
+            jc.tolerance_below = tol
+            jc.weight = 1.0
+            goal_constraints.joint_constraints.append(jc)
+
+        goal = MoveGroup.Goal()
+        req = MotionPlanRequest()
+        req.group_name = PLANNING_GROUP
+        req.num_planning_attempts = 5
+        req.allowed_planning_time = PLANNING_TIME
+        req.max_velocity_scaling_factor = velocity
+        req.max_acceleration_scaling_factor = velocity
+        req.goal_constraints.append(goal_constraints)
+
+        goal.request = req
+        goal.planning_options = PlanningOptions()
+        goal.planning_options.plan_only = False
+        goal.planning_options.replan = True
+        goal.planning_options.replan_attempts = 3
+
+        future = self.move_group_client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=15.0)
+        goal_handle = future.result()
+
+        if not goal_handle or not goal_handle.accepted:
+            self.get_logger().warn("  [perp_adjust] Goal rejected, continuing from original pose.")
+            return False
+
+        result_future = goal_handle.get_result_async()
+        rclpy.spin_until_future_complete(self, result_future, timeout_sec=60.0)
+        result = result_future.result()
+
+        if result is None or result.result.error_code.val != 1:
+            ec = result.result.error_code.val if result else "timeout"
+            self.get_logger().warn(
+                f"  [perp_adjust] Motion failed (error={ec}), continuing from original pose."
+            )
+            return False
+
+        self.get_logger().info("  [perp_adjust] Camera reoriented successfully.")
+        return True
+
+    # ──────────────────────────────────────────────────────────────────
     # Cloud Merging — per-instance + combined
     # ──────────────────────────────────────────────────────────────────
     def _merge_clouds(self):
@@ -1166,7 +1586,9 @@ class DetectAndMergeNode(Node):
                 f"  SOR: k={self.sor_k}, std={self.sor_std}\n"
                 f"  Radius: r={self.radius_filter}m, min_n={self.radius_min_neighbors}\n"
                 f"  Voxel: {self.denoise_voxel_size*1000:.1f}mm\n"
-                f"  Smooth: k={self.smooth_k}, iters={self.smooth_iters}"
+                f"  Smooth: k={self.smooth_k}, iters={self.smooth_iters}\n"
+                f"  Surface smooth: {self.surface_smooth_enabled} "
+                f"(Poisson depth={self.poisson_depth}, Taubin iters={self.taubin_iterations})"
             )
 
             results = denoise_per_bone_pipeline(
@@ -1180,6 +1602,11 @@ class DetectAndMergeNode(Node):
                 voxel_size=self.denoise_voxel_size,
                 smooth_k=self.smooth_k,
                 smooth_iters=self.smooth_iters,
+                surface_smooth_enabled=self.surface_smooth_enabled,
+                poisson_depth=self.poisson_depth,
+                poisson_density_quantile=self.poisson_density_quantile,
+                taubin_iterations=self.taubin_iterations,
+                taubin_mu=self.taubin_mu,
                 verbose=True,
             )
 
@@ -1370,33 +1797,53 @@ class DetectAndMergeNode(Node):
                 o3d.io.write_point_cloud(ref_path_out, pcd)
                 self.get_logger().info(f"  Saved: {ref_path_out}")
 
+            # Load vis reference and apply same transform for publishing
+            vis_path = self.tibia_vis_path if bone_name == "tibia" else self.femur_vis_path
+            aligned_vis_pts = aligned_ref_pts  # fallback to alignment mesh
+            aligned_vis_cols = aligned_ref_cols
+            if vis_path and os.path.exists(vis_path):
+                try:
+                    from scan_and_merge.icp_registration import load_reference_mesh
+                    vis_pcd = load_reference_mesh(vis_path, voxel_size=self.icp_voxel)
+                    # Apply same transform to vis mesh
+                    vis_pcd.transform(T_ref_to_base)
+                    aligned_vis_pts = np.asarray(vis_pcd.points)
+                    aligned_vis_cols = np.asarray(vis_pcd.colors) if vis_pcd.has_colors() else None
+                    self.get_logger().info(
+                        f"  Using vis reference for {bone_name} publishing ({len(aligned_vis_pts)} pts)"
+                    )
+                except Exception as e:
+                    self.get_logger().warn(
+                        f"  Failed to load vis reference for {bone_name}, using alignment mesh: {e}"
+                    )
+
             # PointCloud2 messages — all in lbr_link_0
             scan_msg = numpy_to_pc2(scan_pts, scan_cols, frame_id)
-            ref_msg = numpy_to_pc2(aligned_ref_pts, aligned_ref_cols, frame_id)
+            ref_msg = numpy_to_pc2(aligned_vis_pts, aligned_vis_cols, frame_id)
 
             if bone_name == "tibia":
-                self._registered_msgs["tibia_aligned"] = scan_msg
-                self._registered_msgs["tibia_ref"] = ref_msg
+                self._registered_msgs["scan_tibia"] = scan_msg
+                self._registered_msgs["model_tibia"] = ref_msg
             else:
-                self._registered_msgs["femur_aligned"] = scan_msg
-                self._registered_msgs["femur_ref"] = ref_msg
+                self._registered_msgs["scan_femur"] = scan_msg
+                self._registered_msgs["model_femur"] = ref_msg
 
             self.get_logger().info(
-                f"  {bone_name}: publishing scan + ref in {frame_id}"
+                f"  {bone_name}: publishing /bone_scan + /bone_model in {frame_id}"
             )
 
     # ──────────────────────────────────────────────────────────────────
     # Periodic Publish (latch for RViz)
     # ──────────────────────────────────────────────────────────────────
     def _publish_registered(self):
-        """Publish registered clouds (one-shot, transient_local)."""
+        """Publish scan + ICP-model clouds (one-shot, transient_local)."""
         now = self.get_clock().now().to_msg()
 
         for key, pub in [
-            ("tibia_aligned", self.pub_tibia_aligned),
-            ("femur_aligned", self.pub_femur_aligned),
-            ("tibia_ref",     self.pub_tibia_ref),
-            ("femur_ref",     self.pub_femur_ref),
+            ("scan_tibia",  self.pub_scan_tibia),
+            ("scan_femur",  self.pub_scan_femur),
+            ("model_tibia", self.pub_model_tibia),
+            ("model_femur", self.pub_model_femur),
         ]:
             if key in self._registered_msgs:
                 msg = self._registered_msgs[key]

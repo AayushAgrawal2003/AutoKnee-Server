@@ -5,18 +5,25 @@ Bone Cloud Mover — tracks reference point clouds with IR markers.
 Two modes of operation:
 
 1. BEFORE calibration (anchor+delta):
-   Receives ICP-aligned clouds on /registered/* and /reference/*,
+   Latches onto the ICP-aligned model clouds from /bone_model/*,
    locks the tracker pose at reception time, and publishes clouds
    transformed by the tracker's relative motion.
 
 2. AFTER calibration (direct):
-   Receives T_ref_to_tracker (4x4) and model-frame reference points.
-   Publishes only /tracked/reference/{bone} = T_tracker @ T_ref_to_tracker
-   applied to model-frame points. All other outputs stop.
+   Receives T_ref_to_tracker (4x4) on /calibration/* and model-frame
+   reference points on /model_frame/*. Publishes live-tracked clouds
+   as /tracked/{bone} = T_tracker @ T_ref_to_tracker applied to
+   model-frame points.
 
-Publications (final output):
-    /tracked/reference/femur   PointCloud2   Reference femur in base frame
-    /tracked/reference/tibia   PointCloud2   Reference tibia in base frame
+Topic summary:
+    Subscribes:
+        /bone_model/{bone}             PointCloud2   ICP-aligned model (pre-cal fallback)
+        /model_frame/{bone}            PointCloud2   Model in its own local frame
+        /calibration/ref_to_tracker_*  Float64MultiArray  Calibration 4x4 matrix
+        /kuka_frame/bone_pose_*        PoseStamped   Live IR tracker pose
+
+    Publishes:
+        /tracked/{bone}                PointCloud2   Live-tracked bone model in base frame
 """
 
 import os
@@ -144,11 +151,11 @@ class BoneCloudMover(Node):
         self._model_pts = {}         # bone -> (pts, cols) in model frame
         self._anchor_clouds = {}     # bone -> {pts, cols, initial_pose}  (pre-cal fallback)
 
-        # Output publishers — the only 2 topics that matter
+        # Output publishers — live-tracked bone model in base frame
         self._pub = {}
         for bone in self.BONES:
             self._pub[bone] = self.create_publisher(
-                PointCloud2, f'/tracked/reference/{bone}', 10)
+                PointCloud2, f'/tracked/{bone}', 10)
 
         # Load calibrations from file if provided at launch
         for bone in self.BONES:
@@ -173,16 +180,16 @@ class BoneCloudMover(Node):
                 Float64MultiArray, f'/calibration/ref_to_tracker_{bone}',
                 lambda msg, b=bone: self._cal_cb(msg, b), 10)
 
-        # Model-frame reference clouds (from solver)
+        # Model-frame reference clouds — published by solver after calibration
         for bone in self.BONES:
             self.create_subscription(
-                PointCloud2, f'/reference_model/{bone}',
+                PointCloud2, f'/model_frame/{bone}',
                 lambda msg, b=bone: self._model_cb(msg, b), latch_qos)
 
-        # Pre-calibration fallback: ICP-aligned reference clouds
+        # Pre-calibration fallback: ICP-aligned model clouds in base frame
         for bone in self.BONES:
             self.create_subscription(
-                PointCloud2, f'/reference/{bone}',
+                PointCloud2, f'/bone_model/{bone}',
                 lambda msg, b=bone: self._ref_cloud_cb(msg, b), latch_qos)
 
         self.create_timer(1.0 / rate, self._publish_loop)

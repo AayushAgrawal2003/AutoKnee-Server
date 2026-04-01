@@ -9,6 +9,15 @@ Brings up:
   5. detect_and_merge_node (optional, YOLO detection + filtered merging)
   6. waypoint_visualizer (optional, shows waypoint trajectory in RViz)
   7. bone_cloud_mover (rigid-body tracking of aligned clouds with IR trackers)
+  8. ros2 bag record (optional, records all key topics for offline experiments)
+
+Topic naming:
+  /bone_scan/{tibia,femur}     — filtered+denoised camera scan clouds
+  /bone_model/{tibia,femur}    — ICP-aligned reference PLY (model moved to match scan)
+  /model_frame/{tibia,femur}   — reference PLY in its own local frame (for live tracking)
+  /tracked/{tibia,femur}       — live marker-tracked bone model (from bone_cloud_mover)
+  /calibration/ref_to_tracker_*— calibration 4x4 matrices
+  /kuka_frame/bone_pose_*      — live IR tracker poses
 
 Usage:
   # Original scan workflow (unchanged)
@@ -25,9 +34,17 @@ Usage:
     weights:=~/weights/best.pt \
     load_waypoints:=~/scan_output/waypoints.npy
 
-  # Visualize waypoints AND run detect node
+  # Record a rosbag for offline experiments
   ros2 launch scan_and_merge scan.launch.py \
-    run_detect:=true scan_node:=false visualize_waypoints:=true \
+    run_detect:=true scan_node:=false \
+    record_bag:=true bag_dir:=~/autoknee_bags \
+    weights:=~/weights/best.pt \
+    load_waypoints:=~/scan_output/waypoints.npy
+
+  # Enable perpendicular camera adjustment (reorients toward bone centroid using wrist joints)
+  ros2 launch scan_and_merge scan.launch.py \
+    run_detect:=true scan_node:=false \
+    perpendicular_adjust:=true \
     weights:=~/weights/best.pt \
     load_waypoints:=~/scan_output/waypoints.npy
 
@@ -97,6 +114,13 @@ def generate_launch_description():
     ref_to_tracker_tibia = LaunchConfiguration("ref_to_tracker_tibia")
     ref_to_tracker_femur = LaunchConfiguration("ref_to_tracker_femur")
 
+    # Perpendicular view adjustment
+    perpendicular_adjust = LaunchConfiguration("perpendicular_adjust")
+
+    # Rosbag recording
+    record_bag = LaunchConfiguration("record_bag")
+    bag_dir    = LaunchConfiguration("bag_dir")
+
     return LaunchDescription([
 
         # ── Arguments: Camera mount transform ──
@@ -114,7 +138,7 @@ def generate_launch_description():
                               description="Camera yaw from lbr_link_7 (radians)"),
 
         # ── Arguments: Scan node ──
-        DeclareLaunchArgument("load_waypoints", default_value="~/scan_output/waypoints.npy",
+        DeclareLaunchArgument("load_waypoints", default_value="~/scan_output/new_waypoints.npy",
                               description="Path to waypoints.npy"),
         DeclareLaunchArgument("velocity_scaling", default_value="0.1",
                               description="Robot velocity scaling 0.0-1.0"),
@@ -154,8 +178,20 @@ def generate_launch_description():
         # ── Arguments: Multi-orientation calibration ──
         DeclareLaunchArgument("multi_orientation", default_value="true",
                               description="Enable multi-orientation ICP calibration mode"),
-        DeclareLaunchArgument("n_orientations", default_value="2",
+        DeclareLaunchArgument("n_orientations", default_value="4",
                               description="Number of bone orientations to collect"),
+
+        # ── Arguments: Perpendicular view adjustment ──
+        DeclareLaunchArgument("perpendicular_adjust", default_value="true",
+                              description="Reorient camera perpendicular to bone centroid at each waypoint "
+                                          "(uses top 2-3 wrist joints only)"),
+
+        # ── Arguments: Rosbag recording ──
+        DeclareLaunchArgument("record_bag", default_value="false",
+                              description="Record a rosbag of all key topics for offline experiments"),
+        DeclareLaunchArgument("bag_dir", default_value="~/autoknee_bags",
+                              description="Base output directory for rosbag files "
+                                          "(a timestamped subfolder is created automatically)"),
 
         # ── 1. RealSense Camera ──
         Node(
@@ -256,6 +292,7 @@ def generate_launch_description():
                             "velocity_scaling": velocity_scaling,
                             "multi_orientation": multi_orientation,
                             "n_orientations": n_orientations,
+                            "perpendicular_adjust": perpendicular_adjust,
                         },
                     ],
                 ),
@@ -290,5 +327,52 @@ def generate_launch_description():
             name="bone_cloud_mover",
             output="screen",
             parameters=[mover_config],
+        ),
+
+        # ── 8. Rosbag Recording (optional, record_bag:=true to enable) ──
+        # Records a timestamped bag under bag_dir/ containing all key pipeline topics:
+        #   /bone_scan/*        filtered+denoised camera scan clouds
+        #   /bone_model/*       ICP-aligned reference model clouds
+        #   /model_frame/*      model-frame reference for live tracking
+        #   /tracked/*          live marker-tracked bone output
+        #   /calibration/*      calibration matrices
+        #   /kuka_frame/*       IR tracker poses
+        #   /multi_orient/*     calibration status
+        #   /lbr/joint_states   robot joint states
+        #   camera RGB + depth  for full replay capability
+        TimerAction(
+            period=3.0,  # give camera + nodes time to start
+            actions=[
+                ExecuteProcess(
+                    condition=IfCondition(record_bag),
+                    cmd=[
+                        "bash", "-c", [
+                            "mkdir -p ", bag_dir,
+                            " && ros2 bag record"
+                            " -o ", bag_dir, "/bag_$(date +%Y%m%d_%H%M%S)",
+                            " /bone_scan/tibia"
+                            " /bone_scan/femur"
+                            " /bone_model/tibia"
+                            " /bone_model/femur"
+                            " /model_frame/tibia"
+                            " /model_frame/femur"
+                            " /tracked/tibia"
+                            " /tracked/femur"
+                            " /calibration/ref_to_tracker_tibia"
+                            " /calibration/ref_to_tracker_femur"
+                            " /kuka_frame/bone_pose_tibia"
+                            " /kuka_frame/bone_pose_femur"
+                            " /multi_orient/status"
+                            " /multi_orient/command"
+                            " /lbr/joint_states"
+                            " /camera_arm/camera/color/image_rect_raw"
+                            " /camera_arm/camera/aligned_depth_to_color/image_raw"
+                            " /camera_arm/camera/aligned_depth_to_color/camera_info",
+                        ],
+                    ],
+                    output="screen",
+                    shell=False,
+                ),
+            ],
         ),
     ])

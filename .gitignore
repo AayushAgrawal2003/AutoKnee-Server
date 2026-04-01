@@ -20,7 +20,7 @@ runs/
 detect_output/
 scan_output/
 *.npy
-
+models/
 # IDE
 .vscode/
 .idea/
