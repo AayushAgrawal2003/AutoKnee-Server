@@ -103,6 +103,24 @@
           "color": "#ff0000",
           "axisScale": 0.08,
           "type": "axis"
+        },
+        "/bone_peak_nav/femur_peak": {
+          "visible": true,
+          "color": "#ff6600",
+          "axisScale": 0.08,
+          "type": "axis"
+        },
+        "/bone_peak_nav/tibia_peak": {
+          "visible": true,
+          "color": "#33cc33",
+          "axisScale": 0.08,
+          "type": "axis"
+        },
+        "/bone_peak_nav/ee_target": {
+          "visible": true,
+          "color": "#ff00ff",
+          "axisScale": 0.06,
+          "type": "axis"
         }
       },
       "layers": {
@@ -211,6 +229,51 @@
       "fontSize": 14
     },
 
+    "Publish!peak_femur": {
+      "topicName": "/bone_peak_nav/command",
+      "datatype": "std_msgs/msg/String",
+      "buttonText": "Go Femur Peak",
+      "buttonTooltip": "Move EE to highest Z point on femur",
+      "buttonColor": "#cc6600",
+      "advancedView": false,
+      "value": "{ \"data\": \"femur\" }"
+    },
+    "Publish!peak_tibia": {
+      "topicName": "/bone_peak_nav/command",
+      "datatype": "std_msgs/msg/String",
+      "buttonText": "Go Tibia Peak",
+      "buttonTooltip": "Move EE to highest Z point on tibia",
+      "buttonColor": "#27ae60",
+      "advancedView": false,
+      "value": "{ \"data\": \"tibia\" }"
+    },
+    "Publish!peak_oscillate": {
+      "topicName": "/bone_peak_nav/command",
+      "datatype": "std_msgs/msg/String",
+      "buttonText": "Oscillate Peaks",
+      "buttonTooltip": "Alternate between femur and tibia highest Z points",
+      "buttonColor": "#2980b9",
+      "advancedView": false,
+      "value": "{ \"data\": \"oscillate\" }"
+    },
+    "Publish!peak_stop": {
+      "topicName": "/bone_peak_nav/command",
+      "datatype": "std_msgs/msg/String",
+      "buttonText": "Stop Navigation",
+      "buttonTooltip": "Stop oscillation or current navigation",
+      "buttonColor": "#c0392b",
+      "advancedView": false,
+      "value": "{ \"data\": \"stop\" }"
+    },
+    "RawMessages!peak_status": {
+      "topicPath": "/bone_peak_nav/status.data",
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "fontSize": 14
+    },
+
     "Image!cam1": {
       "imageTopic": "/camera_arm/camera/color/image_rect_raw",
       "calibrationTopic": "",
@@ -230,7 +293,7 @@
     "Log!log1": {
       "searchTerms": [],
       "minLogLevel": 1,
-      "nameFilter": { "detect_and_merge_node": "match", "bone_cloud_mover": "match", "goto_pose_node": "match" }
+      "nameFilter": { "detect_and_merge_node": "match", "bone_cloud_mover": "match", "goto_pose_node": "match", "bone_peak_nav_node": "match" }
     }
   },
 
@@ -277,7 +340,7 @@
         },
         "second": {
           "direction": "column",
-          "splitPercentage": 15,
+          "splitPercentage": 12,
           "first": {
             "direction": "row",
             "splitPercentage": 40,
@@ -286,9 +349,34 @@
           },
           "second": {
             "direction": "column",
-            "splitPercentage": 55,
-            "first": "Image!cam1",
-            "second": "Log!log1"
+            "splitPercentage": 25,
+            "first": {
+              "direction": "row",
+              "splitPercentage": 60,
+              "first": {
+                "direction": "column",
+                "splitPercentage": 50,
+                "first": {
+                  "direction": "row",
+                  "splitPercentage": 50,
+                  "first": "Publish!peak_femur",
+                  "second": "Publish!peak_tibia"
+                },
+                "second": {
+                  "direction": "row",
+                  "splitPercentage": 50,
+                  "first": "Publish!peak_oscillate",
+                  "second": "Publish!peak_stop"
+                }
+              },
+              "second": "RawMessages!peak_status"
+            },
+            "second": {
+              "direction": "column",
+              "splitPercentage": 55,
+              "first": "Image!cam1",
+              "second": "Log!log1"
+            }
           }
         }
       }
