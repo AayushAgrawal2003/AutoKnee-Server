@@ -75,6 +75,15 @@ def generate_launch_description():
                        '--frame-id', 'lbr_link_7', '--child-frame-id', 'tool_tip'],
         ),
 
+        # ── 3. Drill Frame (extend lbr_link_ee by 6.7 cm along Z) ──
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            arguments=['--x', '0', '--y', '0', '--z', '0.067',
+                       '--roll', '0', '--pitch', '0', '--yaw', '4.71' ,
+                       '--frame-id', 'lbr_link_ee', '--child-frame-id', 'drill'],
+        ),
+
         # ── 3. MoveIt (delayed to let hardware connect first) ──
         TimerAction(
             period=5.0,
