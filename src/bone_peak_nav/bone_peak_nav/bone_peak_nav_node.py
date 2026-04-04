@@ -9,16 +9,29 @@ The computed marker pose represents the desired drill frame pose.  Since
 "drill" is a static-TF child of lbr_link_ee (not in the URDF), we convert
 the drill target to an lbr_link_ee target before sending to IK.
 
-Modes (via /bone_peak_nav/command):
+Commands are queued and executed sequentially — sending "tibia" while a
+"femur" motion is in progress will queue tibia to run after femur completes.
+
+Peak poses are continuously published as clouds update, even when idle.
+
+Commands (via /bone_peak_nav/command):
   femur     - go to the highest Z point on the femur
   tibia     - go to the highest Z point on the tibia
   oscillate - alternate between femur and tibia peaks
-  stop      - cancel oscillation
+  stop      - cancel current motion and clear the queue
+
+Parameters (all in SI units — meters, radians):
+  standoff_distance  (float, default 0.03)  — offset along surface normal [m]
+  normal_radius      (float, default 0.01)  — neighbourhood for normal est. [m]
+  velocity_scaling   (float, default 0.5)   — MoveIt velocity/accel scaling [0–1]
+  peak_publish_hz    (float, default 5.0)   — rate for continuous peak publish [Hz]
 
 Usage:
   ros2 run bone_peak_nav bone_peak_nav_node
+  ros2 run bone_peak_nav bone_peak_nav_node --ros-args -p standoff_distance:=0.05
 """
 
+import collections
 import numpy as np
 import threading
 
@@ -185,13 +198,15 @@ class BonePeakNavNode(Node):
         super().__init__("bone_peak_nav_node")
         self.get_logger().info("Bone Peak Nav starting...")
 
-        self.declare_parameter("standoff_distance", 0)
+        self.declare_parameter("standoff_distance", 0.03)
         self.declare_parameter("normal_radius", 0.01)
-        self.declare_parameter("velocity_scaling", 0.5  )
+        self.declare_parameter("velocity_scaling", 0.5)
+        self.declare_parameter("peak_publish_hz", 5.0)
 
         self.standoff = self.get_parameter("standoff_distance").value
         self.normal_radius = self.get_parameter("normal_radius").value
         self.velocity = self.get_parameter("velocity_scaling").value
+        peak_hz = self.get_parameter("peak_publish_hz").value
 
         self.cb_group = ReentrantCallbackGroup()
         self._lock = threading.Lock()
@@ -199,10 +214,13 @@ class BonePeakNavNode(Node):
         # State
         self._femur_points = None
         self._tibia_points = None
-        self._mode = "idle"           # idle | femur | tibia | oscillate
-        self._osc_next = "femur"
         self._motion_in_progress = False
         self.latest_joint_state = None
+
+        # Command queue — commands are processed sequentially
+        self._cmd_queue = collections.deque()
+        self._oscillating = False
+        self._osc_next = "femur"
 
         # TF — needed to look up the static lbr_link_ee → drill transform
         self.tf_buffer = Buffer()
@@ -253,6 +271,10 @@ class BonePeakNavNode(Node):
             callback_group=self.cb_group,
         )
 
+        # ── Continuous peak tracking timer ────────────────────────────
+        period = 1.0 / max(peak_hz, 0.1)
+        self.create_timer(period, self._publish_peaks_timer, callback_group=self.cb_group)
+
         self._publish_status("Ready. Waiting for tracked bone clouds...")
 
     # ── Helpers ───────────────────────────────────────────────────────
@@ -276,6 +298,20 @@ class BonePeakNavNode(Node):
         ps.pose.orientation.w = float(quat[3])
         return ps
 
+    # ── Continuous peak publishing ───────────────────────────────────
+
+    def _publish_peaks_timer(self):
+        """Continuously publish updated peak poses from latest clouds."""
+        for bone, pub in [("femur", self.femur_peak_pub),
+                          ("tibia", self.tibia_peak_pub)]:
+            with self._lock:
+                pts = self._femur_points if bone == "femur" else self._tibia_points
+            if pts is None:
+                continue
+            pos, quat = compute_peak_pose(pts, self.normal_radius, self.standoff)
+            if pos is not None:
+                pub.publish(self._make_pose_stamped(pos, quat))
+
     # ── Callbacks ─────────────────────────────────────────────────────
 
     def _femur_cb(self, msg):
@@ -296,30 +332,42 @@ class BonePeakNavNode(Node):
     def _command_cb(self, msg):
         cmd = msg.data.strip().lower()
 
-        if cmd == "femur":
-            self._mode = "idle"
+        if cmd == "stop":
+            self._oscillating = False
+            self._cmd_queue.clear()
             self._motion_in_progress = False
-            self._send_to_bone("femur")
+            self._publish_status("Stopped — queue cleared")
+            return
 
-        elif cmd == "tibia":
-            self._mode = "idle"
-            self._motion_in_progress = False
-            self._send_to_bone("tibia")
-
-        elif cmd == "oscillate":
-            self._mode = "oscillate"
+        if cmd == "oscillate":
+            self._oscillating = True
             self._osc_next = "femur"
-            self._motion_in_progress = False
+            self._cmd_queue.clear()
             self._publish_status("Oscillation started — heading to femur peak")
-            self._send_to_bone("femur")
+            self._enqueue("femur")
+            return
 
-        elif cmd == "stop":
-            self._mode = "idle"
-            self._motion_in_progress = False
-            self._publish_status("Stopped")
-
+        if cmd in ("femur", "tibia"):
+            self._oscillating = False
+            self._enqueue(cmd)
         else:
             self._publish_status(f"Unknown command: {cmd}")
+
+    def _enqueue(self, bone):
+        """Add a bone target to the queue and kick processing."""
+        self._cmd_queue.append(bone)
+        if not self._motion_in_progress:
+            self._process_queue()
+
+    def _process_queue(self):
+        """Pop the next command and execute it (called when idle)."""
+        if self._motion_in_progress:
+            return
+        if not self._cmd_queue:
+            return
+        bone = self._cmd_queue.popleft()
+        self._motion_in_progress = True
+        self._send_to_bone(bone)
 
     # ── Motion ────────────────────────────────────────────────────────
 
@@ -329,6 +377,7 @@ class BonePeakNavNode(Node):
 
         if points is None:
             self._publish_status(f"No {bone} cloud received yet!")
+            self._on_motion_done(success=False)
             return
 
         drill_pos, drill_quat = compute_peak_pose(
@@ -336,14 +385,8 @@ class BonePeakNavNode(Node):
         )
         if drill_pos is None:
             self._publish_status(f"{bone} cloud is empty!")
+            self._on_motion_done(success=False)
             return
-
-        # Publish drill-frame target for visualisation (the marker)
-        drill_ps = self._make_pose_stamped(drill_pos, drill_quat)
-        if bone == "femur":
-            self.femur_peak_pub.publish(drill_ps)
-        else:
-            self.tibia_peak_pub.publish(drill_ps)
 
         self._publish_status(f"Planning {bone} peak motion...")
         self._execute_motion(bone, drill_pos, drill_quat)
@@ -508,20 +551,22 @@ class BonePeakNavNode(Node):
         self._on_motion_done(success=True)
 
     def _on_motion_done(self, success):
-        """Handle oscillation continuation after a motion finishes."""
-        if self._mode != "oscillate":
-            self._motion_in_progress = False
+        """Handle queue / oscillation continuation after a motion finishes."""
+        self._motion_in_progress = False
+
+        # Oscillation: enqueue the next bone automatically
+        if self._oscillating:
+            if not success:
+                self._oscillating = False
+                self._publish_status("Oscillation stopped — motion failed")
+                return
+            self._osc_next = "tibia" if self._osc_next == "femur" else "femur"
+            self._publish_status(f"Heading to {self._osc_next} peak")
+            self._enqueue(self._osc_next)
             return
 
-        if not success:
-            self._mode = "idle"
-            self._motion_in_progress = False
-            self._publish_status("Oscillation stopped — motion failed")
-            return
-
-        self._osc_next = "tibia" if self._osc_next == "femur" else "femur"
-        self._publish_status(f"Heading to {self._osc_next} peak")
-        self._send_to_bone(self._osc_next)
+        # Process remaining queued commands
+        self._process_queue()
 
 
 # ──────────────────────────────────────────────────────────────────────
