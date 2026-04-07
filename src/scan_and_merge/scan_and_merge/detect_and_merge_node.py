@@ -310,6 +310,11 @@ class DetectAndMergeNode(Node):
         self.pub_model_frame_tibia = self.create_publisher(PointCloud2, "/model_frame/tibia", latch_qos)
         self.pub_model_frame_femur = self.create_publisher(PointCloud2, "/model_frame/femur", latch_qos)
 
+        # /icp_transform/* — T_ref_to_base (4x4 flattened) so bone_cloud_mover knows
+        #                     the global placement of the PLY model origin
+        self._icp_tf_pub_tibia = self.create_publisher(Float64MultiArray, "/icp_transform/tibia", latch_qos)
+        self._icp_tf_pub_femur = self.create_publisher(Float64MultiArray, "/icp_transform/femur", latch_qos)
+
         # ── Output dirs ──
         self.det_dir = os.path.join(OUTPUT_DIR, "detections")
         self.cloud_dir = os.path.join(OUTPUT_DIR, "clouds")
@@ -1782,6 +1787,14 @@ class DetectAndMergeNode(Node):
                 "rmse": result["rmse"],
                 "T_icp": T_ref_to_base.copy(),
             }
+
+            # Publish T_ref_to_base so bone_cloud_mover can broadcast TF
+            icp_tf_msg = Float64MultiArray()
+            icp_tf_msg.data = T_ref_to_base.flatten().tolist()
+            if bone_name == "tibia":
+                self._icp_tf_pub_tibia.publish(icp_tf_msg)
+            else:
+                self._icp_tf_pub_femur.publish(icp_tf_msg)
 
             # Save transform + aligned reference PLY
             np.save(

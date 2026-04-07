@@ -35,6 +35,8 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header, Float64MultiArray
+from geometry_msgs.msg import TransformStamped
+from tf2_ros import TransformBroadcaster
 
 
 FRAME_ID = 'lbr_link_0'
@@ -67,6 +69,36 @@ def _invert_T(T):
     Ti[:3, :3] = R.T
     Ti[:3, 3] = -R.T @ t
     return Ti
+
+
+def _rotation_matrix_to_quaternion(R):
+    """Convert 3x3 rotation matrix to quaternion (x, y, z, w)."""
+    trace = R[0, 0] + R[1, 1] + R[2, 2]
+    if trace > 0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (R[2, 1] - R[1, 2]) * s
+        y = (R[0, 2] - R[2, 0]) * s
+        z = (R[1, 0] - R[0, 1]) * s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+    return x, y, z, w
 
 
 def _pc2_to_numpy(msg):
@@ -150,12 +182,15 @@ class BoneCloudMover(Node):
         self._calibration = {}       # bone -> 4x4 T_ref_to_tracker
         self._model_pts = {}         # bone -> (pts, cols) in model frame
         self._anchor_clouds = {}     # bone -> {pts, cols, initial_pose}  (pre-cal fallback)
+        self._icp_transform = {}     # bone -> 4x4 T_ref_to_base from ICP
 
         # Output publishers — live-tracked bone model in base frame
         self._pub = {}
         for bone in self.BONES:
             self._pub[bone] = self.create_publisher(
                 PointCloud2, f'/tracked/{bone}', 10)
+
+        self._tf_broadcaster = TransformBroadcaster(self)
 
         # Load calibrations from file if provided at launch
         for bone in self.BONES:
@@ -186,6 +221,12 @@ class BoneCloudMover(Node):
                 PointCloud2, f'/model_frame/{bone}',
                 lambda msg, b=bone: self._model_cb(msg, b), latch_qos)
 
+        # ICP transform: T_ref_to_base (PLY origin → lbr_link_0)
+        for bone in self.BONES:
+            self.create_subscription(
+                Float64MultiArray, f'/icp_transform/{bone}',
+                lambda msg, b=bone: self._icp_tf_cb(msg, b), latch_qos)
+
         # Pre-calibration fallback: ICP-aligned model clouds in base frame
         for bone in self.BONES:
             self.create_subscription(
@@ -207,6 +248,12 @@ class BoneCloudMover(Node):
             return
         self._calibration[bone] = np.array(msg.data).reshape(4, 4)
         self.get_logger().info(f'[{bone}] Calibration received — direct tracking active')
+
+    def _icp_tf_cb(self, msg, bone):
+        if len(msg.data) != 16:
+            return
+        self._icp_transform[bone] = np.array(msg.data).reshape(4, 4)
+        self.get_logger().info(f'[{bone}] ICP transform (T_ref_to_base) received')
 
     def _model_cb(self, msg, bone):
         pts, cols = _pc2_to_numpy(msg)
@@ -246,6 +293,22 @@ class BoneCloudMover(Node):
                 out = (T[:3, :3] @ pts.T).T + T[:3, 3]
                 self._pub[bone].publish(
                     _numpy_to_pc2(out, cols, FRAME_ID, stamp))
+
+                # Broadcast TF: lbr_link_0 -> tracked/{bone}_origin
+                tf_msg = TransformStamped()
+                tf_msg.header.stamp = stamp
+                tf_msg.header.frame_id = FRAME_ID
+                tf_msg.child_frame_id = f'tracked/{bone}_origin'
+                tf_msg.transform.translation.x = float(T[0, 3])
+                tf_msg.transform.translation.y = float(T[1, 3])
+                tf_msg.transform.translation.z = float(T[2, 3])
+                qx, qy, qz, qw = _rotation_matrix_to_quaternion(T[:3, :3])
+                tf_msg.transform.rotation.x = float(qx)
+                tf_msg.transform.rotation.y = float(qy)
+                tf_msg.transform.rotation.z = float(qz)
+                tf_msg.transform.rotation.w = float(qw)
+                self._tf_broadcaster.sendTransform(tf_msg)
+
                 continue
 
             # MODE 2: Pre-calibration fallback — anchor + delta
@@ -255,6 +318,25 @@ class BoneCloudMover(Node):
                 out = (T_delta[:3, :3] @ anchor['pts'].T).T + T_delta[:3, 3]
                 self._pub[bone].publish(
                     _numpy_to_pc2(out, anchor['cols'], FRAME_ID, stamp))
+
+                # Broadcast TF: lbr_link_0 -> tracked/{bone}_origin
+                # T_delta @ T_ref_to_base = global transform of PLY origin
+                T_icp = self._icp_transform.get(bone)
+                if T_icp is not None:
+                    T_global = T_delta @ T_icp
+                    tf_msg = TransformStamped()
+                    tf_msg.header.stamp = stamp
+                    tf_msg.header.frame_id = FRAME_ID
+                    tf_msg.child_frame_id = f'tracked/{bone}_origin'
+                    tf_msg.transform.translation.x = float(T_global[0, 3])
+                    tf_msg.transform.translation.y = float(T_global[1, 3])
+                    tf_msg.transform.translation.z = float(T_global[2, 3])
+                    qx, qy, qz, qw = _rotation_matrix_to_quaternion(T_global[:3, :3])
+                    tf_msg.transform.rotation.x = float(qx)
+                    tf_msg.transform.rotation.y = float(qy)
+                    tf_msg.transform.rotation.z = float(qz)
+                    tf_msg.transform.rotation.w = float(qw)
+                    self._tf_broadcaster.sendTransform(tf_msg)
 
 
 # ---------------------------------------------------------------------------

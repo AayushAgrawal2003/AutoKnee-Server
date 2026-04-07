@@ -46,9 +46,10 @@ from sksurgerynditracker.nditracker import NDITracker
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
 from std_msgs.msg import Float64
 from ament_index_python.packages import get_package_share_directory
+from tf2_ros import TransformBroadcaster
 
 
 # ---------------------------------------------------------------------------
@@ -57,12 +58,12 @@ from ament_index_python.packages import get_package_share_directory
 
 ROM_DIR = os.path.join(get_package_share_directory('ir_tracking'), 'roms')
 
-# (rom_filename, output_topic, x_correction_mm)
+# (rom_filename, output_topic, x_correction_mm, tf_child_frame)
 # Index 0 = femur, 1 = tibia, 2 = EE (ISTAR)
 TRACKERS = [
-    ("BBT-110017Rev1-FemurTracker-SPH.rom", "/kuka_frame/bone_pose_femur", 8.770 - (-2.127)),
-    ("BBT-TrackerA-Gray_Polaris.rom",       "/kuka_frame/bone_pose_tibia", 0.0),
-    ("ISTAR-APPLE01.rom",                   "/kuka_frame/pose_ee",         0.0),
+    ("BBT-110017Rev1-FemurTracker-SPH.rom", "/kuka_frame/bone_pose_femur", 8.770 - (-2.127), "tracked_femur"),
+    ("BBT-TrackerA-Gray_Polaris.rom",       "/kuka_frame/bone_pose_tibia", 0.0,               "tracked_tibia"),
+    ("ISTAR-APPLE01.rom",                   "/kuka_frame/pose_ee",         0.0,               "tracked_ee"),
 ]
 
 EE_INDEX = 2  # ISTAR is the 3rd tracker
@@ -200,7 +201,8 @@ class IRTrackingNode(Node):
         self.romfiles = []
         self.topics = []
         self.x_corrections = []
-        for rom_name, topic, dx in TRACKERS:
+        self.tf_child_frames = []
+        for rom_name, topic, dx, tf_child in TRACKERS:
             rom_path = os.path.join(ROM_DIR, rom_name)
             if not os.path.isfile(rom_path):
                 self.get_logger().fatal(f"ROM not found: {rom_path}")
@@ -208,6 +210,7 @@ class IRTrackingNode(Node):
             self.romfiles.append(rom_path)
             self.topics.append(topic)
             self.x_corrections.append(dx)
+            self.tf_child_frames.append(tf_child)
             corr = f"  (X correction: +{dx:.3f}mm)" if dx else ""
             self.get_logger().info(f"ROM: {rom_name}{corr}  ->  {topic}")
 
@@ -248,6 +251,7 @@ class IRTrackingNode(Node):
             self.pose_pubs.append(self.create_publisher(PoseStamped, topic, 10))
 
         self.drift_pub = self.create_publisher(Float64, '/kuka_frame/drift', 10)
+        self.tf_broadcaster = TransformBroadcaster(self)
 
         # ── Timers ───────────────────────────────────────────────────────
         self.create_timer(1.0 / hz, self._poll_and_publish)
@@ -326,12 +330,27 @@ class IRTrackingNode(Node):
                 return  # nothing to publish yet
 
         # ── 4. Transform all poses to KUKA base frame and publish ────────
+        tf_msgs = []
         for i in range(len(self.romfiles)):
             if cam_poses[i] is None:
                 continue
             T_kuka = self.T_kuka_cam @ cam_poses[i]
             out_msg = matrix_to_pose_stamped(T_kuka, 'lbr_link_0', stamp)
             self.pose_pubs[i].publish(out_msg)
+
+            # Broadcast TF: lbr_link_0 -> tracked_{bone}
+            t = TransformStamped()
+            t.header.stamp = stamp
+            t.header.frame_id = 'lbr_link_0'
+            t.child_frame_id = self.tf_child_frames[i]
+            t.transform.translation.x = out_msg.pose.position.x
+            t.transform.translation.y = out_msg.pose.position.y
+            t.transform.translation.z = out_msg.pose.position.z
+            t.transform.rotation = out_msg.pose.orientation
+            tf_msgs.append(t)
+
+        if tf_msgs:
+            self.tf_broadcaster.sendTransform(tf_msgs)
 
         # ── 5. Drift computation and publishing ──────────────────────────
         if (self._latest_istar_global is not None
