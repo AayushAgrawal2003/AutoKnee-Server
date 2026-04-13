@@ -33,6 +33,9 @@ setup(
             "ee_publisher = scan_and_merge.marker_pub:main",
             "bone_cloud_mover = scan_and_merge.bone_cloud_mover:main",
             "goto_pose_node = scan_and_merge.goto_pose_node:main",
+            "hand_guiding_teach_node = scan_and_merge.hand_guiding:main",
+            "foot_pedal_node = scan_and_merge.pedal:main",
+            
         ],
     },
 )
