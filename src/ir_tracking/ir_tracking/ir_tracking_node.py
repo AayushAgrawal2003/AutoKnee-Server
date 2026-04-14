@@ -191,11 +191,15 @@ class IRTrackingNode(Node):
         # ── ROS 2 Parameters ──────────────────────────────────────────────
         self.declare_parameter('hz', 50.0)
         self.declare_parameter('vega_ip', '')
+        self.declare_parameter(
+            'drift_log_dir',
+            '/home/kneepolean/AUTOKnee-server/detect_output')
 
         hz = self.get_parameter('hz').value
         vega_ip = self.get_parameter('vega_ip').value
         if not vega_ip:
             vega_ip = None
+        drift_log_dir = self.get_parameter('drift_log_dir').value
 
         # ── Resolve ROM files ────────────────────────────────────────────
         self.romfiles = []
@@ -252,6 +256,15 @@ class IRTrackingNode(Node):
 
         self.drift_pub = self.create_publisher(Float64, '/kuka_frame/drift', 10)
         self.tf_broadcaster = TransformBroadcaster(self)
+
+        # ── Drift log file ───────────────────────────────────────────────
+        os.makedirs(drift_log_dir, exist_ok=True)
+        log_name = time.strftime('drift_%Y%m%d_%H%M%S.txt')
+        self._drift_log_path = os.path.join(drift_log_dir, log_name)
+        self._drift_log_file = open(self._drift_log_path, 'w')
+        self._drift_log_file.write('# ros_time_s\tdrift_mm\n')
+        self._drift_log_file.flush()
+        self.get_logger().info(f"Logging drift to {self._drift_log_path}")
 
         # ── Timers ───────────────────────────────────────────────────────
         self.create_timer(1.0 / hz, self._poll_and_publish)
@@ -367,6 +380,11 @@ class IRTrackingNode(Node):
             msg.data = self._drift_m
             self.drift_pub.publish(msg)
 
+            t_sec = stamp.sec + stamp.nanosec * 1e-9
+            self._drift_log_file.write(
+                f"{t_sec:.6f}\t{self._drift_m * 1000.0:.6f}\n")
+            self._drift_log_file.flush()
+
     # ── Periodic status log ──────────────────────────────────────────────
 
     def _log_status(self):
@@ -392,6 +410,12 @@ class IRTrackingNode(Node):
             except Exception:
                 pass
             self.ndi_tracker = None
+        if getattr(self, '_drift_log_file', None):
+            try:
+                self._drift_log_file.close()
+            except Exception:
+                pass
+            self._drift_log_file = None
         super().destroy_node()
 
 
