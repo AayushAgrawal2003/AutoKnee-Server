@@ -2,23 +2,30 @@
 """
 Go-To-Pose Node for KUKA LBR Med 7
 
-Subscribes to a PoseStamped topic and allows the user to send the end effector
-to that position via a Foxglove button. The drill frame axes are matched
-to the goal pose axes.
+Subscribes to a PoseStamped topic. As soon as a pose arrives, the node
+starts continuously tracking it with the same plan-and-execute worker
+pattern as bone_peak_nav: every tracking_period it replans iff the
+desired drill pose moved more than movement_threshold_m since the last
+executed target.
+
+If a new pose arrives while a motion is in flight, the current goal is
+cancelled ("new goal received, still tracking old" is published as a
+status), and the worker picks up the new target on its next tick.
 
 Topics:
   Subscribed:
-    /goal_pose_input (geometry_msgs/PoseStamped) - input goal pose
-    /goto_pose/command (std_msgs/String) - "go" command from Foxglove button
+    <input_topic> (geometry_msgs/PoseStamped) - goal pose for the drill frame
+    /goto_pose/command (std_msgs/String) - "stop" to halt tracking
+    /lbr/joint_states (sensor_msgs/JointState) - IK seed
 
   Published:
-    /goto_pose/target (geometry_msgs/PoseStamped) - current target pose (for visualization)
+    /goto_pose/target (geometry_msgs/PoseStamped) - latest received goal
+    /goto_pose/ee_target (geometry_msgs/PoseStamped) - computed EE target
     /goto_pose/status (std_msgs/String) - status messages
-
-Usage:
-  ros2 run scan_and_merge goto_pose_node
-
 """
+
+import threading
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -39,7 +46,6 @@ from moveit_msgs.msg import (
 from moveit_msgs.srv import GetPositionIK
 
 import numpy as np
-import threading
 
 from tf2_ros import Buffer, TransformListener
 
@@ -56,9 +62,21 @@ ROBOT_NAME = "lbr"
 PLANNING_GROUP = "arm"
 BASE_FRAME = f"{ROBOT_NAME}_link_0"
 EE_LINK = f"{ROBOT_NAME}_link_ee"
+DRILL_FRAME = "drill"
 
-VELOCITY_SCALING = 0.1
-PLANNING_TIME = 10.0
+
+def wait_for_future(future, timeout_sec=10.0):
+    """Poll a future until done or timeout.
+
+    Safe to call from the worker thread: the main MultiThreadedExecutor
+    is spinning the node and fulfils futures in the background.
+    """
+    end = time.monotonic() + timeout_sec
+    while time.monotonic() < end:
+        if future.done():
+            return future.result()
+        time.sleep(0.02)
+    return None
 
 
 def quat_to_rotation_matrix(q):
@@ -101,27 +119,60 @@ def rotation_matrix_to_quat(R):
     return np.array([x, y, z, w])
 
 
+MODE_IDLE = "idle"
+MODE_TRACK = "track"
+
+
 class GoToPoseNode(Node):
     def __init__(self):
         super().__init__("goto_pose_node")
         self.get_logger().info("GoToPose Node starting...")
 
+        # Params — match bone_peak_nav so both nodes share defaults.
         self.declare_parameter("input_topic", "/surgical_plan/probe_pose")
-        self.declare_parameter("velocity_scaling", VELOCITY_SCALING)
+        self.declare_parameter("velocity_scaling", 0.1)
+        self.declare_parameter("planning_time", 10.0)
+        self.declare_parameter("num_planning_attempts", 5)
+        self.declare_parameter("tracking_rate_hz", 1.0)
+        self.declare_parameter("movement_threshold_m", 0.001)
 
         self.input_topic = self.get_parameter("input_topic").get_parameter_value().string_value
-        self.velocity = self.get_parameter("velocity_scaling").get_parameter_value().double_value
+        self.velocity = float(self.get_parameter("velocity_scaling").value)
+        self.planning_time = float(self.get_parameter("planning_time").value)
+        self.num_attempts = int(self.get_parameter("num_planning_attempts").value)
+        self.tracking_period = 1.0 / max(
+            float(self.get_parameter("tracking_rate_hz").value), 0.05)
+        self.move_threshold = float(self.get_parameter("movement_threshold_m").value)
 
         self.cb_group = ReentrantCallbackGroup()
 
-        # State
-        self.latest_goal_pose = None
-        self.latest_joint_state = None
-        self._lock = threading.Lock()
+        # Pose + joint state caches.
+        # _active_goal_pose is what the worker is currently tracking.
+        # _pending_goal_pose is the latest pose received while the
+        # worker was already tracking — it is promoted to active only
+        # when `go` is published on /goto_pose/command.
+        self._active_goal_pose = None   # geometry_msgs/PoseStamped
+        self._pending_goal_pose = None
+        self._latest_joint_state = None
+        self._pose_lock = threading.Lock()
+
+        # Last successfully executed drill-frame target (world/base position).
+        # None means "never executed" so the first tick always plans.
+        self._last_target = None
+
+        # Mode state + worker synchronization. Mirrors bone_peak_nav:
+        # a new pose sets _mode=track and notifies _mode_cv; if a goal
+        # is in flight, it is cancelled so the worker re-plans.
+        self._mode_cv = threading.Condition()
+        self._mode = MODE_IDLE
+        self._active_goal_handle = None
+        self._shutdown = False
 
         # TF
         self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.tf_listener = TransformListener(
+            self.tf_buffer, self, spin_thread=True,
+        )
 
         # Subscribers
         self.goal_sub = self.create_subscription(
@@ -133,7 +184,7 @@ class GoToPoseNode(Node):
             callback_group=self.cb_group,
         )
         self.joint_sub = self.create_subscription(
-            JointState, "/lbr/joint_states", self._joint_state_cb, 10,
+            JointState, f"/{ROBOT_NAME}/joint_states", self._joint_state_cb, 10,
             callback_group=self.cb_group,
         )
 
@@ -149,19 +200,27 @@ class GoToPoseNode(Node):
 
         # MoveIt2 action client
         self.move_group_client = ActionClient(
-            self, MoveGroup, "/lbr/move_action",
+            self, MoveGroup, f"/{ROBOT_NAME}/move_action",
             callback_group=self.cb_group,
         )
 
         # IK service client
         self._ik_client = self.create_client(
-            GetPositionIK, "/lbr/compute_ik",
+            GetPositionIK, f"/{ROBOT_NAME}/compute_ik",
             callback_group=self.cb_group,
         )
 
+        # Persistent worker — wakes on mode changes and plans+executes.
+        self._worker_thread = threading.Thread(
+            target=self._worker_loop, daemon=True, name="goto_pose_worker",
+        )
+        self._worker_thread.start()
+
         self._publish_status("Ready. Waiting for goal pose...")
         self.get_logger().info(f"Subscribed to {self.input_topic} for goal poses")
-        self.get_logger().info("Send 'go' to /goto_pose/command to execute motion")
+        self.get_logger().info("Publish 'stop' to /goto_pose/command to halt tracking")
+
+    # ── Small helpers ─────────────────────────────────────────────────
 
     def _publish_status(self, text):
         msg = String()
@@ -169,46 +228,168 @@ class GoToPoseNode(Node):
         self.status_pub.publish(msg)
         self.get_logger().info(f"[status] {text}")
 
-    def _goal_pose_cb(self, msg: PoseStamped):
-        with self._lock:
-            self.latest_goal_pose = msg
+    # ── Subscriber callbacks ──────────────────────────────────────────
 
-        # Republish for visualization
+    def _goal_pose_cb(self, msg: PoseStamped):
+        # Always republish for visualization.
         self.target_pub.publish(msg)
 
         pos = msg.pose.position
+
+        with self._pose_lock:
+            already_tracking = self._active_goal_pose is not None
+            if already_tracking:
+                # Buffer as pending — the worker keeps tracking the old
+                # goal (which still follows its source frame via TF).
+                # A `go` command on /goto_pose/command promotes pending
+                # → active.
+                self._pending_goal_pose = msg
+            else:
+                self._active_goal_pose = msg
+
+        if already_tracking:
+            self._publish_status(
+                f"New goal received [{pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f}] — "
+                f"still tracking old. Publish 'go' to /goto_pose/command to switch."
+            )
+            return
+
+        # First goal — kick the worker into tracking mode.
+        with self._mode_cv:
+            self._mode = MODE_TRACK
+            self._last_target = None
+            self._mode_cv.notify_all()
         self._publish_status(
-            f"Received goal: [{pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f}] in {msg.header.frame_id}"
+            f"Tracking new goal [{pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f}] in {msg.header.frame_id}"
         )
 
     def _joint_state_cb(self, msg: JointState):
-        self.latest_joint_state = msg
+        self._latest_joint_state = msg
 
     def _command_cb(self, msg: String):
         cmd = msg.data.strip().lower()
-        if cmd == "go":
-            self._execute_goto()
-        else:
-            self._publish_status(f"Unknown command: {cmd}")
-
-    def _execute_goto(self):
-        with self._lock:
-            goal_pose = self.latest_goal_pose
-
-        if goal_pose is None:
-            self._publish_status("No goal pose received yet!")
+        if cmd == "stop":
+            with self._mode_cv:
+                self._mode = MODE_IDLE
+                self._last_target = None
+                self._mode_cv.notify_all()
+            with self._pose_lock:
+                self._active_goal_pose = None
+                self._pending_goal_pose = None
+            self._cancel_active_goal()
+            self._publish_status("Stopped")
             return
 
-        self._publish_status("Planning motion to goal...")
+        if cmd == "go":
+            with self._pose_lock:
+                if self._pending_goal_pose is None:
+                    if self._active_goal_pose is None:
+                        self._publish_status("No goal pose received yet!")
+                        return
+                    self._publish_status("No pending goal — already tracking the active one.")
+                    return
+                # Promote pending → active.
+                self._active_goal_pose = self._pending_goal_pose
+                self._pending_goal_pose = None
+                promoted = self._active_goal_pose
 
-        # Get goal position
+            # Force an immediate replan on the new active target.
+            with self._mode_cv:
+                self._mode = MODE_TRACK
+                self._last_target = None
+                self._mode_cv.notify_all()
+            self._cancel_active_goal()
+
+            pos = promoted.pose.position
+            self._publish_status(
+                f"Switched to new goal [{pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f}]"
+            )
+            return
+
+        self._publish_status(f"Unknown command: {cmd}")
+
+    def _cancel_active_goal(self):
+        gh = self._active_goal_handle
+        if gh is not None:
+            try:
+                gh.cancel_goal_async()
+            except Exception:
+                pass
+
+    # ── Persistent worker loop ────────────────────────────────────────
+
+    def _worker_loop(self):
+        """Continuous tracking loop, responsive to new poses.
+
+        Idle:  wait on _mode_cv.
+        Track: every tracking_period, replan iff the latest pose moved
+               more than move_threshold since the last executed target.
+        A new pose cancels the in-flight goal; _last_target is cleared
+        so the next tick always plans.
+        """
+        while not self._shutdown and rclpy.ok():
+            with self._mode_cv:
+                while (self._mode == MODE_IDLE
+                       and not self._shutdown and rclpy.ok()):
+                    self._mode_cv.wait(timeout=1.0)
+                mode = self._mode
+
+            if self._shutdown or not rclpy.ok():
+                return
+
+            with self._pose_lock:
+                goal_pose = self._active_goal_pose
+            if goal_pose is None:
+                self._sleep_interruptible(self.tracking_period, mode)
+                continue
+
+            # Resolve the desired drill pose in the base frame.
+            drill_base = self._goal_to_base(goal_pose)
+            if drill_base is None:
+                self._sleep_interruptible(self.tracking_period, mode)
+                continue
+            drill_pos, drill_quat = drill_base
+
+            # Gate on movement threshold (translation only — matches
+            # bone_peak_nav semantics and is robust to quaternion noise).
+            if (self._last_target is not None
+                    and np.linalg.norm(drill_pos - self._last_target) < self.move_threshold):
+                self._sleep_interruptible(self.tracking_period, mode)
+                continue
+
+            ok = self._plan_and_execute(drill_pos, drill_quat)
+            if ok:
+                self._last_target = drill_pos.copy()
+
+            with self._mode_cv:
+                if self._mode != mode:
+                    # Overridden during execution — re-enter the loop.
+                    continue
+
+            self._sleep_interruptible(self.tracking_period, mode)
+
+    def _sleep_interruptible(self, seconds, current_mode):
+        """Sleep up to `seconds`, waking early on mode change."""
+        end = time.monotonic() + seconds
+        with self._mode_cv:
+            while (not self._shutdown
+                   and self._mode == current_mode
+                   and time.monotonic() < end):
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._mode_cv.wait(timeout=remaining)
+
+    # ── Goal → base-frame drill pose ──────────────────────────────────
+
+    def _goal_to_base(self, goal_pose: PoseStamped):
+        """Return (drill_pos, drill_quat) in BASE_FRAME for a goal pose,
+        or None on TF failure."""
         goal_pos = np.array([
             goal_pose.pose.position.x,
             goal_pose.pose.position.y,
             goal_pose.pose.position.z,
         ])
-
-        # Get goal orientation
         goal_quat = np.array([
             goal_pose.pose.orientation.x,
             goal_pose.pose.orientation.y,
@@ -216,10 +397,6 @@ class GoToPoseNode(Node):
             goal_pose.pose.orientation.w,
         ])
 
-        self.get_logger().info(f"Goal position: {goal_pos}")
-        self.get_logger().info(f"Goal quaternion: {goal_quat}")
-
-        # Transform goal to base frame if needed
         goal_frame = goal_pose.header.frame_id
         if goal_frame and goal_frame != BASE_FRAME:
             try:
@@ -227,179 +404,154 @@ class GoToPoseNode(Node):
                     BASE_FRAME, goal_frame,
                     rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=2.0)
                 )
-                # Transform position
-                t = tf.transform.translation
-                q = tf.transform.rotation
-                R = quat_to_rotation_matrix([q.x, q.y, q.z, q.w])
-                goal_pos = R @ goal_pos + np.array([t.x, t.y, t.z])
-
-                # Transform orientation
-                R_goal = quat_to_rotation_matrix(goal_quat)
-                R_transformed = R @ R_goal
-                goal_quat = rotation_matrix_to_quat(R_transformed)
-
-                self.get_logger().info(f"Transformed goal to {BASE_FRAME}")
             except Exception as e:
                 self._publish_status(f"TF lookup failed: {e}")
-                return
+                return None
+            t = tf.transform.translation
+            q = tf.transform.rotation
+            R = quat_to_rotation_matrix([q.x, q.y, q.z, q.w])
+            goal_pos = R @ goal_pos + np.array([t.x, t.y, t.z])
+            R_goal = quat_to_rotation_matrix(goal_quat)
+            goal_quat = rotation_matrix_to_quat(R @ R_goal)
 
-        # goal_pos/goal_quat is where we want the drill frame to be.
-        # Compute where lbr_link_ee must be so drill lands there.
-        # T_base_ee = T_base_drill * T_drill_ee
+        return goal_pos, goal_quat
+
+    # ── Core: plan + execute one target ───────────────────────────────
+
+    def _plan_and_execute(self, drill_pos, drill_quat):
+        """Plan and execute a motion that places the drill frame at
+        drill_pos / drill_quat in BASE_FRAME."""
+        # Convert drill-frame target → lbr_link_ee target.
         try:
             tf_drill_ee = self.tf_buffer.lookup_transform(
-                'drill', EE_LINK,
+                DRILL_FRAME, EE_LINK,
                 rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=2.0)
             )
         except Exception as e:
             self._publish_status(f"TF lookup drill→{EE_LINK} failed: {e}")
-            return
+            return False
 
         dt = tf_drill_ee.transform.translation
         dq = tf_drill_ee.transform.rotation
         R_drill_ee = quat_to_rotation_matrix([dq.x, dq.y, dq.z, dq.w])
-        R_goal_mat = quat_to_rotation_matrix(goal_quat)
+        R_goal_mat = quat_to_rotation_matrix(drill_quat)
 
-        goal_pos = R_goal_mat @ np.array([dt.x, dt.y, dt.z]) + goal_pos
-        goal_quat = rotation_matrix_to_quat(R_goal_mat @ R_drill_ee)
+        ee_pos = R_goal_mat @ np.array([dt.x, dt.y, dt.z]) + drill_pos
+        ee_quat = rotation_matrix_to_quat(R_goal_mat @ R_drill_ee)
 
-        self.get_logger().info(f"Computed EE pose: pos={goal_pos}, quat={goal_quat}")
+        # Publish EE target for visualization.
+        ps = self._make_pose_stamped(ee_pos, ee_quat)
+        self.ee_target_pub.publish(ps)
 
-        # Call IK to get joint angles
-        if not self._ik_client.wait_for_service(timeout_sec=5.0):
-            self._publish_status("IK service not available!")
-            return
+        # IK
+        joint_targets = self._solve_ik(ee_pos, ee_quat)
+        if joint_targets is None:
+            self._publish_status("IK failed")
+            return False
 
-        # Get current joint state for seed
-        if self.latest_joint_state is None:
-            self._publish_status("No joint state received yet!")
-            return
+        self._publish_status("Planning + executing…")
+        ok = self._send_joint_goal(joint_targets)
+        if ok:
+            self._publish_status("Motion complete.")
+        else:
+            self._publish_status("Motion failed (or superseded)")
+        return ok
 
-        joint_map = dict(zip(
-            self.latest_joint_state.name,
-            self.latest_joint_state.position
-        ))
-
-        ik_req = GetPositionIK.Request()
-        ik_req.ik_request.group_name = PLANNING_GROUP
-        ik_req.ik_request.avoid_collisions = True
-        ik_req.ik_request.timeout.sec = 5
-
-        # Build pose stamped for IK
+    def _make_pose_stamped(self, pos, quat):
         ps = PoseStamped()
         ps.header.frame_id = BASE_FRAME
         ps.header.stamp = self.get_clock().now().to_msg()
-        ps.pose.position.x = float(goal_pos[0])
-        ps.pose.position.y = float(goal_pos[1])
-        ps.pose.position.z = float(goal_pos[2])
-        ps.pose.orientation.x = float(goal_quat[0])
-        ps.pose.orientation.y = float(goal_quat[1])
-        ps.pose.orientation.z = float(goal_quat[2])
-        ps.pose.orientation.w = float(goal_quat[3])
-        ik_req.ik_request.pose_stamped = ps
+        ps.pose.position.x = float(pos[0])
+        ps.pose.position.y = float(pos[1])
+        ps.pose.position.z = float(pos[2])
+        ps.pose.orientation.x = float(quat[0])
+        ps.pose.orientation.y = float(quat[1])
+        ps.pose.orientation.z = float(quat[2])
+        ps.pose.orientation.w = float(quat[3])
+        return ps
 
-        # Publish the computed EE target pose for visualization
-        self.ee_target_pub.publish(ps)
-        self.get_logger().info("Published computed EE target to /goto_pose/ee_target")
+    def _solve_ik(self, ee_pos, ee_quat):
+        if not self._ik_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().error("compute_ik service unavailable")
+            return None
+        if self._latest_joint_state is None:
+            self.get_logger().error("no joint state received yet — cannot seed IK")
+            return None
 
-        self.get_logger().info(
-            f"IK request pose in {BASE_FRAME}:\n"
-            f"  position: [{goal_pos[0]:.4f}, {goal_pos[1]:.4f}, {goal_pos[2]:.4f}]\n"
-            f"  orientation: [{goal_quat[0]:.4f}, {goal_quat[1]:.4f}, {goal_quat[2]:.4f}, {goal_quat[3]:.4f}]"
-        )
+        joint_map = dict(zip(
+            self._latest_joint_state.name,
+            self._latest_joint_state.position,
+        ))
+        seed = JointState()
+        seed.name = JOINT_NAMES
+        seed.position = [float(joint_map.get(j, 0.0)) for j in JOINT_NAMES]
 
-        # Seed state
-        from sensor_msgs.msg import JointState as SensorJointState
-        seed_js = SensorJointState()
-        seed_js.name = JOINT_NAMES
-        seed_js.position = [float(joint_map.get(j, 0.0)) for j in JOINT_NAMES]
-        ik_req.ik_request.robot_state.joint_state = seed_js
+        req = GetPositionIK.Request()
+        req.ik_request.group_name = PLANNING_GROUP
+        req.ik_request.avoid_collisions = True
+        req.ik_request.timeout.sec = 5
+        req.ik_request.robot_state.joint_state = seed
+        req.ik_request.pose_stamped = self._make_pose_stamped(ee_pos, ee_quat)
 
-        self._publish_status("Computing IK...")
+        fut = self._ik_client.call_async(req)
+        result = wait_for_future(fut, timeout_sec=10.0)
+        if result is None or result.error_code.val != 1:
+            ec = result.error_code.val if result else "timeout"
+            self.get_logger().error(f"IK failed (error {ec})")
+            return None
 
-        ik_future = self._ik_client.call_async(ik_req)
-        rclpy.spin_until_future_complete(self, ik_future, timeout_sec=10.0)
-        ik_result = ik_future.result()
+        solved = dict(zip(
+            result.solution.joint_state.name,
+            result.solution.joint_state.position,
+        ))
+        return [float(solved.get(j, joint_map.get(j, 0.0))) for j in JOINT_NAMES]
 
-        if ik_result is None or ik_result.error_code.val != 1:
-            ec = ik_result.error_code.val if ik_result else "timeout"
-            # Common error codes: -31 = NO_IK_SOLUTION, -12 = INVALID_GOAL_CONSTRAINTS
-            error_names = {
-                -31: "NO_IK_SOLUTION (pose may be unreachable)",
-                -12: "INVALID_GOAL_CONSTRAINTS",
-                -10: "START_STATE_IN_COLLISION",
-                -4: "PLANNING_FAILED",
-            }
-            error_msg = error_names.get(ec, f"error code {ec}")
-            self._publish_status(f"IK failed: {error_msg}")
-            self.get_logger().error(
-                f"IK failed with error {ec}. The requested pose may be:\n"
-                f"  - Outside robot workspace\n"
-                f"  - In collision\n"
-                f"  - Requiring joint limits to be exceeded\n"
-                f"Try a different goal pose or orientation."
-            )
-            return
+    def _send_joint_goal(self, joint_targets):
+        if not self.move_group_client.wait_for_server(timeout_sec=10.0):
+            self.get_logger().error("move_action not available")
+            return False
 
-        # Extract solved joint positions
-        ik_joint_map = dict(
-            zip(ik_result.solution.joint_state.name,
-                ik_result.solution.joint_state.position)
-        )
-
-        self._publish_status("IK solved, executing motion...")
-
-        # Build MoveIt goal with joint constraints
-        goal_constraints = Constraints()
-        for jname in JOINT_NAMES:
-            jval = ik_joint_map.get(jname, joint_map.get(jname, 0.0))
+        constraints = Constraints()
+        for jname, val in zip(JOINT_NAMES, joint_targets):
             jc = JointConstraint()
             jc.joint_name = jname
-            jc.position = float(jval)
+            jc.position = float(val)
             jc.tolerance_above = 0.01
             jc.tolerance_below = 0.01
             jc.weight = 1.0
-            goal_constraints.joint_constraints.append(jc)
+            constraints.joint_constraints.append(jc)
+
+        plan_req = MotionPlanRequest()
+        plan_req.group_name = PLANNING_GROUP
+        plan_req.num_planning_attempts = self.num_attempts
+        plan_req.allowed_planning_time = self.planning_time
+        plan_req.max_velocity_scaling_factor = self.velocity
+        plan_req.max_acceleration_scaling_factor = self.velocity
+        plan_req.goal_constraints.append(constraints)
 
         goal = MoveGroup.Goal()
-        req = MotionPlanRequest()
-        req.group_name = PLANNING_GROUP
-        req.num_planning_attempts = 5
-        req.allowed_planning_time = PLANNING_TIME
-        req.max_velocity_scaling_factor = self.velocity
-        req.max_acceleration_scaling_factor = self.velocity
-        req.goal_constraints.append(goal_constraints)
-
-        goal.request = req
+        goal.request = plan_req
         goal.planning_options = PlanningOptions()
         goal.planning_options.plan_only = False
         goal.planning_options.replan = True
         goal.planning_options.replan_attempts = 3
 
-        if not self.move_group_client.wait_for_server(timeout_sec=10.0):
-            self._publish_status("MoveGroup action server not available!")
-            return
+        send_fut = self.move_group_client.send_goal_async(goal)
+        gh = wait_for_future(send_fut, timeout_sec=10.0)
+        if gh is None or not gh.accepted:
+            self.get_logger().error("MoveGroup rejected goal")
+            return False
 
-        future = self.move_group_client.send_goal_async(goal)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=15.0)
-        goal_handle = future.result()
-
-        if not goal_handle or not goal_handle.accepted:
-            self._publish_status("Goal rejected by MoveGroup!")
-            return
-
-        self._publish_status("Executing motion...")
-
-        result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future, timeout_sec=60.0)
-        result = result_future.result()
-
-        if result is None or result.result.error_code.val != 1:
-            ec = result.result.error_code.val if result else "timeout"
-            self._publish_status(f"Motion failed (error={ec})")
-            return
-
-        self._publish_status("Motion complete! EE at goal position.")
+        self._active_goal_handle = gh
+        try:
+            res_fut = gh.get_result_async()
+            res = wait_for_future(res_fut, timeout_sec=120.0)
+            if res is None:
+                self.get_logger().error("MoveGroup result timeout")
+                return False
+            return res.result.error_code.val == 1
+        finally:
+            self._active_goal_handle = None
 
 
 def main(args=None):
@@ -415,6 +567,10 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        node._shutdown = True
+        with node._mode_cv:
+            node._mode_cv.notify_all()
+        node._cancel_active_goal()
         node.destroy_node()
         rclpy.shutdown()
 

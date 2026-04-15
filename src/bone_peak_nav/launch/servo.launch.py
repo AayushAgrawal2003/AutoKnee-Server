@@ -64,6 +64,11 @@ def generate_launch_description():
             output="screen",
             parameters=[{
                 "input_topic": LaunchConfiguration("goto_pose_input_topic"),
+                "velocity_scaling": LaunchConfiguration("velocity_scaling"),
+                "planning_time": LaunchConfiguration("planning_time"),
+                "num_planning_attempts": LaunchConfiguration("num_planning_attempts"),
+                "tracking_rate_hz": LaunchConfiguration("tracking_rate_hz"),
+                "movement_threshold_m": LaunchConfiguration("movement_threshold_m"),
             }],
         ),
     ])
