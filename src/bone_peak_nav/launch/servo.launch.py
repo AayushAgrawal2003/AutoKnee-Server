@@ -20,7 +20,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("standoff_distance", default_value="0.02"),
-        DeclareLaunchArgument("velocity_scaling", default_value="0.6"),
+        DeclareLaunchArgument("velocity_scaling", default_value="0.15"),
         DeclareLaunchArgument("planning_time", default_value="50.0"),
         DeclareLaunchArgument("num_planning_attempts", default_value="5"),
         DeclareLaunchArgument("tracking_rate_hz", default_value="5.0"),

@@ -89,6 +89,27 @@ def quat_to_rotation_matrix(q):
     ])
 
 
+def quat_slerp(q0, q1, t):
+    """Spherical linear interpolation between two unit quaternions [x,y,z,w]."""
+    q0 = np.asarray(q0, dtype=float)
+    q1 = np.asarray(q1, dtype=float)
+    dot = float(np.dot(q0, q1))
+    # Take the shorter arc.
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    # Nearly colinear → linear interp + renormalize.
+    if dot > 0.9995:
+        out = q0 + t * (q1 - q0)
+        return out / np.linalg.norm(out)
+    theta_0 = np.arccos(dot)
+    theta = theta_0 * t
+    sin_theta_0 = np.sin(theta_0)
+    s0 = np.sin(theta_0 - theta) / sin_theta_0
+    s1 = np.sin(theta) / sin_theta_0
+    return s0 * q0 + s1 * q1
+
+
 def rotation_matrix_to_quat(R):
     """Convert 3x3 rotation matrix to quaternion [x, y, z, w]."""
     trace = np.trace(R)
@@ -135,6 +156,14 @@ class GoToPoseNode(Node):
         self.declare_parameter("num_planning_attempts", 5)
         self.declare_parameter("tracking_rate_hz", 1.0)
         self.declare_parameter("movement_threshold_m", 0.001)
+        # Option A: EMA on translation + SLERP on quaternion. Lower
+        # alpha = heavier smoothing (more lag). 1.0 disables the filter.
+        self.declare_parameter("pose_filter_alpha", 0.2)
+        # Option F: after a motion completes, measure the drill TF and
+        # re-plan with an offset if the tip error exceeds this. Zero
+        # disables closed-loop correction.
+        self.declare_parameter("tip_error_correction_m", 0.0005)
+        self.declare_parameter("tip_error_correction_max_iters", 2)
 
         self.input_topic = self.get_parameter("input_topic").get_parameter_value().string_value
         self.velocity = float(self.get_parameter("velocity_scaling").value)
@@ -143,6 +172,9 @@ class GoToPoseNode(Node):
         self.tracking_period = 1.0 / max(
             float(self.get_parameter("tracking_rate_hz").value), 0.05)
         self.move_threshold = float(self.get_parameter("movement_threshold_m").value)
+        self.pose_filter_alpha = float(self.get_parameter("pose_filter_alpha").value)
+        self.tip_err_thresh = float(self.get_parameter("tip_error_correction_m").value)
+        self.tip_err_max_iters = int(self.get_parameter("tip_error_correction_max_iters").value)
 
         self.cb_group = ReentrantCallbackGroup()
 
@@ -159,6 +191,16 @@ class GoToPoseNode(Node):
         # Last successfully executed drill-frame target (world/base position).
         # None means "never executed" so the first tick always plans.
         self._last_target = None
+
+        # Option A: EMA-filtered drill pose in BASE_FRAME. Reset on
+        # every new active goal so the filter starts clean.
+        self._filtered_pos = None   # np.array shape (3,)
+        self._filtered_quat = None  # np.array shape (4,) [x,y,z,w]
+
+        # Option D: cached joint vector from the last successful IK
+        # solve. Used as the seed on subsequent IK calls so the arm
+        # does not jump configurations between ticks.
+        self._last_solved_joints = None
 
         # Mode state + worker synchronization. Mirrors bone_peak_nav:
         # a new pose sets _mode=track and notifies _mode_cv; if a goal
@@ -258,6 +300,9 @@ class GoToPoseNode(Node):
         with self._mode_cv:
             self._mode = MODE_TRACK
             self._last_target = None
+            self._filtered_pos = None
+            self._filtered_quat = None
+            self._last_solved_joints = None
             self._mode_cv.notify_all()
         self._publish_status(
             f"Tracking new goal [{pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f}] in {msg.header.frame_id}"
@@ -272,6 +317,9 @@ class GoToPoseNode(Node):
             with self._mode_cv:
                 self._mode = MODE_IDLE
                 self._last_target = None
+                self._filtered_pos = None
+                self._filtered_quat = None
+                self._last_solved_joints = None
                 self._mode_cv.notify_all()
             with self._pose_lock:
                 self._active_goal_pose = None
@@ -293,10 +341,13 @@ class GoToPoseNode(Node):
                 self._pending_goal_pose = None
                 promoted = self._active_goal_pose
 
-            # Force an immediate replan on the new active target.
+            # Force an immediate replan on the new active target and
+            # reset the EMA filter so it starts clean on the new pose.
             with self._mode_cv:
                 self._mode = MODE_TRACK
                 self._last_target = None
+                self._filtered_pos = None
+                self._filtered_quat = None
                 self._mode_cv.notify_all()
             self._cancel_active_goal()
 
@@ -348,7 +399,25 @@ class GoToPoseNode(Node):
             if drill_base is None:
                 self._sleep_interruptible(self.tracking_period, mode)
                 continue
-            drill_pos, drill_quat = drill_base
+            raw_pos, raw_quat = drill_base
+
+            # Option A: EMA on translation + SLERP on quaternion. The
+            # filter state is reset whenever a new active goal is
+            # installed, so the first tick after a switch seeds from
+            # the raw pose.
+            alpha = max(0.0, min(1.0, self.pose_filter_alpha))
+            if self._filtered_pos is None or self._filtered_quat is None:
+                self._filtered_pos = raw_pos.copy()
+                self._filtered_quat = raw_quat.copy()
+            else:
+                self._filtered_pos = (
+                    alpha * raw_pos + (1.0 - alpha) * self._filtered_pos
+                )
+                self._filtered_quat = quat_slerp(
+                    self._filtered_quat, raw_quat, alpha
+                )
+            drill_pos = self._filtered_pos.copy()
+            drill_quat = self._filtered_quat.copy()
 
             # Gate on movement threshold (translation only — matches
             # bone_peak_nav semantics and is robust to quaternion noise).
@@ -420,8 +489,71 @@ class GoToPoseNode(Node):
 
     def _plan_and_execute(self, drill_pos, drill_quat):
         """Plan and execute a motion that places the drill frame at
-        drill_pos / drill_quat in BASE_FRAME."""
-        # Convert drill-frame target → lbr_link_ee target.
+        drill_pos / drill_quat in BASE_FRAME.
+
+        Option F: after each successful motion, measure the actual
+        drill TF and, if the residual exceeds tip_error_correction_m,
+        re-plan with the desired target offset by the measured error.
+        Runs up to tip_error_correction_max_iters correction passes.
+        """
+        target_drill_pos = np.asarray(drill_pos, dtype=float)
+        # The drill-frame target pos we'll feed to IK. Starts equal to
+        # the desired pos, then gets offset by measured errors.
+        commanded_pos = target_drill_pos.copy()
+        last_ok = False
+
+        max_iters = max(1, 1 + self.tip_err_max_iters)
+        for iteration in range(max_iters):
+            ee_pose = self._drill_to_ee(commanded_pos, drill_quat)
+            if ee_pose is None:
+                return False
+            ee_pos, ee_quat = ee_pose
+
+            self.ee_target_pub.publish(self._make_pose_stamped(ee_pos, ee_quat))
+
+            joint_targets = self._solve_ik(ee_pos, ee_quat)
+            if joint_targets is None:
+                self._publish_status("IK failed")
+                return last_ok
+
+            if iteration == 0:
+                self._publish_status("Planning + executing…")
+            else:
+                self._publish_status(
+                    f"Correction pass {iteration}: replanning to close residual"
+                )
+
+            ok = self._send_joint_goal(joint_targets)
+            last_ok = ok
+            if not ok:
+                self._publish_status("Motion failed (or superseded)")
+                return False
+
+            # Residual check: actual drill TF vs desired drill_pos.
+            if self.tip_err_thresh <= 0.0 or iteration >= self.tip_err_max_iters:
+                break
+            actual = self._lookup_drill_world_pos()
+            if actual is None:
+                break
+            err_vec = target_drill_pos - actual
+            err = float(np.linalg.norm(err_vec))
+            self.get_logger().info(
+                f"Tip residual after pass {iteration}: {err*1000:.3f} mm"
+            )
+            if err < self.tip_err_thresh:
+                break
+            # Push the commanded drill target in the direction of the
+            # measured error so the next plan over-reaches by exactly
+            # the residual. Bounded accumulation — the IK seed cache
+            # (Option D) keeps us near the same config.
+            commanded_pos = commanded_pos + err_vec
+
+        self._publish_status("Motion complete.")
+        return last_ok
+
+    def _drill_to_ee(self, drill_pos, drill_quat):
+        """Turn a desired drill pose in BASE_FRAME into the matching
+        lbr_link_ee pose. Returns (ee_pos, ee_quat) or None on TF fail."""
         try:
             tf_drill_ee = self.tf_buffer.lookup_transform(
                 DRILL_FRAME, EE_LINK,
@@ -429,7 +561,7 @@ class GoToPoseNode(Node):
             )
         except Exception as e:
             self._publish_status(f"TF lookup drill→{EE_LINK} failed: {e}")
-            return False
+            return None
 
         dt = tf_drill_ee.transform.translation
         dq = tf_drill_ee.transform.rotation
@@ -438,24 +570,19 @@ class GoToPoseNode(Node):
 
         ee_pos = R_goal_mat @ np.array([dt.x, dt.y, dt.z]) + drill_pos
         ee_quat = rotation_matrix_to_quat(R_goal_mat @ R_drill_ee)
+        return ee_pos, ee_quat
 
-        # Publish EE target for visualization.
-        ps = self._make_pose_stamped(ee_pos, ee_quat)
-        self.ee_target_pub.publish(ps)
-
-        # IK
-        joint_targets = self._solve_ik(ee_pos, ee_quat)
-        if joint_targets is None:
-            self._publish_status("IK failed")
-            return False
-
-        self._publish_status("Planning + executing…")
-        ok = self._send_joint_goal(joint_targets)
-        if ok:
-            self._publish_status("Motion complete.")
-        else:
-            self._publish_status("Motion failed (or superseded)")
-        return ok
+    def _lookup_drill_world_pos(self):
+        """Return the actual drill origin in BASE_FRAME, or None."""
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                BASE_FRAME, DRILL_FRAME, rclpy.time.Time(),
+                rclpy.duration.Duration(seconds=0.2),
+            )
+        except Exception:
+            return None
+        t = tf.transform.translation
+        return np.array([t.x, t.y, t.z])
 
     def _make_pose_stamped(self, pos, quat):
         ps = PoseStamped()
@@ -482,9 +609,16 @@ class GoToPoseNode(Node):
             self._latest_joint_state.name,
             self._latest_joint_state.position,
         ))
+        # Option D: prefer the last successfully solved joints as the
+        # IK seed — this keeps the arm in the same configuration
+        # across ticks and prevents shoulder/elbow flips. Fall back to
+        # the live joint state on the very first solve.
         seed = JointState()
         seed.name = JOINT_NAMES
-        seed.position = [float(joint_map.get(j, 0.0)) for j in JOINT_NAMES]
+        if self._last_solved_joints is not None:
+            seed.position = [float(v) for v in self._last_solved_joints]
+        else:
+            seed.position = [float(joint_map.get(j, 0.0)) for j in JOINT_NAMES]
 
         req = GetPositionIK.Request()
         req.ik_request.group_name = PLANNING_GROUP
@@ -504,20 +638,25 @@ class GoToPoseNode(Node):
             result.solution.joint_state.name,
             result.solution.joint_state.position,
         ))
-        return [float(solved.get(j, joint_map.get(j, 0.0))) for j in JOINT_NAMES]
+        joints = [float(solved.get(j, joint_map.get(j, 0.0))) for j in JOINT_NAMES]
+        # Cache for the next IK seed (Option D).
+        self._last_solved_joints = joints[:]
+        return joints
 
     def _send_joint_goal(self, joint_targets):
         if not self.move_group_client.wait_for_server(timeout_sec=10.0):
             self.get_logger().error("move_action not available")
             return False
 
+        # Option C: tight joint tolerance (~0.057°) so MoveIt drives the
+        # arm to the IK solution rather than a 0.57° neighborhood.
         constraints = Constraints()
         for jname, val in zip(JOINT_NAMES, joint_targets):
             jc = JointConstraint()
             jc.joint_name = jname
             jc.position = float(val)
-            jc.tolerance_above = 0.01
-            jc.tolerance_below = 0.01
+            jc.tolerance_above = 0.001
+            jc.tolerance_below = 0.001
             jc.weight = 1.0
             constraints.joint_constraints.append(jc)
 
