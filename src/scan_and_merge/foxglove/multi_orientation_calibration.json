@@ -82,7 +82,7 @@
           "pointSize": 2
         },
         "/camera_arm/camera/depth/color/points": {
-          "visible": false,
+          "visible": true,
           "colorMode": "rgb",
           "pointSize": 1
         },
@@ -293,7 +293,65 @@
     "Log!log1": {
       "searchTerms": [],
       "minLogLevel": 1,
-      "nameFilter": { "detect_and_merge_node": "match", "bone_cloud_mover": "match", "goto_pose_node": "match", "bone_peak_nav_node": "match" }
+      "nameFilter": { "detect_and_merge_node": "match", "bone_cloud_mover": "match", "goto_pose_node": "match", "bone_peak_nav_node": "match", "ir_tracking_node": "match" }
+    },
+
+    "Publish!recalibrate": {
+      "topicName": "/ir_tracking/command",
+      "datatype": "std_msgs/msg/String",
+      "buttonText": "\u26a0  Recalibrate (current pose)",
+      "buttonTooltip": "Recompute T_kuka_cam from the robot's CURRENT pose. Downstream nodes (bone_cloud_mover, bone_peak_nav, bone_scan_trajectory) will see a pose discontinuity \u2014 re-lock any frozen targets afterwards.",
+      "buttonColor": "#e74c3c",
+      "advancedView": false,
+      "value": "{ \"data\": \"recalibrate\" }"
+    },
+    "Indicator!drift_alert": {
+      "path": "/ir_tracking/drift_alert.data",
+      "style": "background",
+      "fallbackColor": "#7f8c8d",
+      "fallbackLabel": "drift unknown",
+      "rules": [
+        {
+          "operator": "=",
+          "rawValue": "true",
+          "color": "#e74c3c",
+          "label": "DRIFT HIGH \u2014 RECALIBRATE"
+        },
+        {
+          "operator": "=",
+          "rawValue": "false",
+          "color": "#27ae60",
+          "label": "DRIFT OK"
+        }
+      ]
+    },
+    "RawMessages!calibration_status": {
+      "topicPath": "/ir_tracking/calibration_status.data",
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "fontSize": 16
+    },
+    "Plot!drift_mm": {
+      "paths": [
+        {
+          "value": "/kuka_frame/drift.data",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "drift (m)",
+          "color": "#f39c12"
+        }
+      ],
+      "minYValue": "0",
+      "maxYValue": "",
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": false,
+      "legendDisplay": "floating",
+      "xAxisVal": "timestamp",
+      "sidebarDimension": 0,
+      "foxglovePanelTitle": "Drift over time (m) \u2014 alert at 0.005"
     }
   },
 
@@ -307,75 +365,95 @@
     "first": "3D!3dview1",
     "second": {
       "direction": "column",
-      "splitPercentage": 14,
-      "first": "RawMessages!status1",
-      "second": {
+      "splitPercentage": 30,
+      "first": {
         "direction": "column",
-        "splitPercentage": 52,
+        "splitPercentage": 55,
         "first": {
           "direction": "column",
-          "splitPercentage": 50,
+          "splitPercentage": 55,
+          "first": {
+            "direction": "row",
+            "splitPercentage": 60,
+            "first": "Publish!recalibrate",
+            "second": "Indicator!drift_alert"
+          },
+          "second": "RawMessages!calibration_status"
+        },
+        "second": "Plot!drift_mm"
+      },
+      "second": {
+        "direction": "column",
+        "splitPercentage": 14,
+        "first": "RawMessages!status1",
+        "second": {
+          "direction": "column",
+          "splitPercentage": 52,
           "first": {
             "direction": "column",
             "splitPercentage": 50,
             "first": {
-              "direction": "row",
+              "direction": "column",
               "splitPercentage": 50,
-              "first": "Publish!pub_both",
-              "second": "Publish!pub_femur"
+              "first": {
+                "direction": "row",
+                "splitPercentage": 50,
+                "first": "Publish!pub_both",
+                "second": "Publish!pub_femur"
+              },
+              "second": {
+                "direction": "row",
+                "splitPercentage": 50,
+                "first": "Publish!pub_tibia",
+                "second": "Publish!pub_neither"
+              }
             },
             "second": {
               "direction": "row",
               "splitPercentage": 50,
-              "first": "Publish!pub_tibia",
-              "second": "Publish!pub_neither"
+              "first": "Publish!pub_ready",
+              "second": "Publish!pub_solve"
             }
           },
           "second": {
-            "direction": "row",
-            "splitPercentage": 50,
-            "first": "Publish!pub_ready",
-            "second": "Publish!pub_solve"
-          }
-        },
-        "second": {
-          "direction": "column",
-          "splitPercentage": 12,
-          "first": {
-            "direction": "row",
-            "splitPercentage": 40,
-            "first": "Publish!goto_pose_go",
-            "second": "RawMessages!goto_status"
-          },
-          "second": {
             "direction": "column",
-            "splitPercentage": 25,
+            "splitPercentage": 12,
             "first": {
               "direction": "row",
-              "splitPercentage": 60,
-              "first": {
-                "direction": "column",
-                "splitPercentage": 50,
-                "first": {
-                  "direction": "row",
-                  "splitPercentage": 50,
-                  "first": "Publish!peak_femur",
-                  "second": "Publish!peak_tibia"
-                },
-                "second": {
-                  "direction": "row",
-                  "splitPercentage": 50,
-                  "first": "Publish!peak_oscillate",
-                  "second": "Publish!peak_stop"
-                }
-              },
-              "second": "RawMessages!peak_status"
+              "splitPercentage": 40,
+              "first": "Publish!goto_pose_go",
+              "second": "RawMessages!goto_status"
             },
             "second": {
               "direction": "column",
-              "splitPercentage": 55,
-              "first": "Image!cam1",
-              "second": "Log!log1"
+              "splitPercentage": 25,
+              "first": {
+                "direction": "row",
+                "splitPercentage": 60,
+                "first": {
+                  "direction": "column",
+                  "splitPercentage": 50,
+                  "first": {
+                    "direction": "row",
+                    "splitPercentage": 50,
+                    "first": "Publish!peak_femur",
+                    "second": "Publish!peak_tibia"
+                  },
+                  "second": {
+                    "direction": "row",
+                    "splitPercentage": 50,
+                    "first": "Publish!peak_oscillate",
+                    "second": "Publish!peak_stop"
+                  }
+                },
+                "second": "RawMessages!peak_status"
+              },
+              "second": {
+                "direction": "column",
+                "splitPercentage": 55,
+                "first": "Image!cam1",
+                "second": "Log!log1"
+              }
             }
           }
         }

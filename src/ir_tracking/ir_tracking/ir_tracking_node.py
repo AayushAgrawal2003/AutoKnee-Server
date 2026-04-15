@@ -22,22 +22,31 @@ Drift (published every frame, logged every 2s):
     drift_m   = ||predicted.position - actual.position||
 
 Subscriptions:
-    /ee_marker_pos    PoseStamped   ISTAR ROM origin in KUKA base frame (meters)
+    /ee_marker_pos       PoseStamped   ISTAR ROM origin in KUKA base frame (m)
+    /ir_tracking/command String        Commands: "recalibrate", "reset_drift_alert"
 
 Publications:
-    /kuka_frame/pose_ee           PoseStamped   EE tracker in KUKA base frame
-    /kuka_frame/bone_pose_femur   PoseStamped   Femur tracker in KUKA base frame
-    /kuka_frame/bone_pose_tibia   PoseStamped   Tibia tracker in KUKA base frame
-    /kuka_frame/drift             Float64       Translational drift magnitude (meters)
+    /kuka_frame/pose_ee               PoseStamped   EE tracker in KUKA base frame
+    /kuka_frame/bone_pose_femur       PoseStamped   Femur tracker in KUKA base frame
+    /kuka_frame/bone_pose_tibia       PoseStamped   Tibia tracker in KUKA base frame
+    /kuka_frame/drift                 Float64       Drift magnitude (m)
+    /ir_tracking/drift_alert          Bool          Latched alert: sustained high drift
+    /ir_tracking/calibration_status   String        Latched human-readable status line
+
+Services:
+    /ir_tracking/recalibrate          Trigger       Recompute T_kuka_cam from current pose
 
 Usage:
     ros2 run ir_tracking ir_tracking_node
     ros2 run ir_tracking ir_tracking_node --ros-args -p hz:=50.0 -p vega_ip:=169.254.9.239
+    ros2 service call /ir_tracking/recalibrate std_srvs/srv/Trigger
 """
 
 import os
 import sys
 import time
+from collections import deque
+
 import numpy as np
 
 from ir_tracking.vega_discover import discover_vega, VegaNotFoundError
@@ -48,7 +57,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from geometry_msgs.msg import PoseStamped, TransformStamped
-from std_msgs.msg import Float64, String
+from std_msgs.msg import Bool, Float64, String
+from std_srvs.srv import Trigger
 from ament_index_python.packages import get_package_share_directory
 from tf2_ros import TransformBroadcaster
 
@@ -198,6 +208,10 @@ class IRTrackingNode(Node):
             os.path.expanduser('~/detect_output'))
         # How many samples to buffer before flushing to disk.
         self.declare_parameter('drift_flush_every', 25)
+        # Drift-alert thresholds. Alert latches True when rolling-window
+        # drift stays above threshold for at least window_s seconds.
+        self.declare_parameter('drift_alert_threshold_mm', 5.0)
+        self.declare_parameter('drift_alert_window_s', 3.0)
 
         hz = self.get_parameter('hz').value
         vega_ip = self.get_parameter('vega_ip').value
@@ -207,6 +221,10 @@ class IRTrackingNode(Node):
             self.get_parameter('drift_log_dir').value)
         self._drift_flush_every = int(
             self.get_parameter('drift_flush_every').value)
+        self._drift_alert_threshold_m = (
+            float(self.get_parameter('drift_alert_threshold_mm').value) / 1000.0)
+        self._drift_alert_window_s = float(
+            self.get_parameter('drift_alert_window_s').value)
 
         # ── Resolve ROM files ────────────────────────────────────────────
         self.romfiles = []
@@ -251,10 +269,19 @@ class IRTrackingNode(Node):
         self._latest_cam_ee_matrix = None      # from Polaris (4x4, meters)
         self._drift_m = None
 
+        # Drift-alert rolling window. Holds (monotonic_time, drift_m) so
+        # we can decide whether high drift is sustained vs a momentary spike.
+        self._drift_history = deque()
+        self._drift_alert_active = False
+
         # ── ROS subscription: ISTAR ROM origin in KUKA base frame ────────
         self.create_subscription(
             PoseStamped, '/ee_marker_pos', self._istar_global_cb, 10)
         self.get_logger().info("Subscribed to /ee_marker_pos (KUKA EE + CAD offset)")
+
+        # Foxglove Publish buttons write std_msgs/String to this topic.
+        self.create_subscription(
+            String, '/ir_tracking/command', self._command_cb, 10)
 
         # ── ROS publishers ───────────────────────────────────────────────
         self.pose_pubs = []
@@ -263,6 +290,25 @@ class IRTrackingNode(Node):
 
         self.drift_pub = self.create_publisher(Float64, '/kuka_frame/drift', 10)
         self.tf_broadcaster = TransformBroadcaster(self)
+
+        # Latched status topics so a Foxglove client connecting after the
+        # fact immediately sees the current alert/status instead of blank.
+        latched_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        self.drift_alert_pub = self.create_publisher(
+            Bool, '/ir_tracking/drift_alert', latched_qos)
+        self.calibration_status_pub = self.create_publisher(
+            String, '/ir_tracking/calibration_status', latched_qos)
+        self._publish_drift_alert(False)
+        self._publish_calibration_status(
+            "UNCALIBRATED • waiting for /ee_marker_pos + Polaris EE")
+
+        # CLI / programmatic recalibration trigger.
+        self.create_service(
+            Trigger, '/ir_tracking/recalibrate', self._recalibrate_srv_cb)
 
         # ── Drift log file ───────────────────────────────────────────────
         # Start in the fallback dir so samples before /session/dir arrives
@@ -389,27 +435,12 @@ class IRTrackingNode(Node):
         if cam_poses[EE_INDEX] is not None:
             self._latest_cam_ee_matrix = cam_poses[EE_INDEX]
 
-        # ── 3. Calibrate (one-shot) ──────────────────────────────────────
+        # ── 3. Calibrate (one-shot bootstrap) ────────────────────────────
         if not self.calibrated:
-            if (self._latest_istar_global is not None
-                    and self._latest_cam_ee_matrix is not None):
-                T_kuka_rom = pose_msg_to_matrix(self._latest_istar_global)
-                T_cam_rom = self._latest_cam_ee_matrix
-                self.T_kuka_cam = T_kuka_rom @ invert_transform(T_cam_rom)
-                self.calibrated = True
-
-                t = self.T_kuka_cam[:3, 3]
-                rz, ry, rx = rotation_matrix_to_euler_zyx(
-                    self.T_kuka_cam[:3, :3])
-                self.get_logger().info("=== CALIBRATION COMPLETE ===")
-                self.get_logger().info(
-                    f"  T_kuka_cam translation: "
-                    f"({t[0]:.4f}, {t[1]:.4f}, {t[2]:.4f}) m")
-                self.get_logger().info(
-                    f"  T_kuka_cam rotation (ZYX): "
-                    f"({rz:.2f}, {ry:.2f}, {rx:.2f}) deg")
-            else:
-                return  # nothing to publish yet
+            try:
+                self._compute_calibration("startup")
+            except RuntimeError:
+                return  # inputs not ready yet
 
         # ── 4. Transform all poses to KUKA base frame and publish ────────
         tf_msgs = []
@@ -454,6 +485,148 @@ class IRTrackingNode(Node):
                 f"{t_sec:.6f}\t{self._drift_m * 1000.0:.6f}\n")
             if len(self._drift_buffer) >= self._drift_flush_every:
                 self._flush_drift_buffer()
+
+            self._update_drift_alert(now)
+
+    # ── Calibration / recalibration ──────────────────────────────────────
+
+    def _compute_calibration(self, reason):
+        """(Re)compute T_kuka_cam from the latest /ee_marker_pos + Polaris
+        EE readings. Returns a human-readable summary. Raises RuntimeError
+        if either input hasn't been received yet."""
+        if self._latest_istar_global is None:
+            raise RuntimeError("no /ee_marker_pos received yet")
+        if self._latest_cam_ee_matrix is None:
+            raise RuntimeError("no Polaris EE tracker frame yet")
+
+        T_kuka_rom = pose_msg_to_matrix(self._latest_istar_global)
+        T_cam_rom = self._latest_cam_ee_matrix
+        T_new = T_kuka_rom @ invert_transform(T_cam_rom)
+
+        delta_str = ""
+        if self.T_kuka_cam is not None:
+            dt = T_new[:3, 3] - self.T_kuka_cam[:3, 3]
+            delta_str = (
+                f" (shift vs prev: {np.linalg.norm(dt) * 1000.0:.2f} mm)")
+
+        was_first = not self.calibrated
+        self.T_kuka_cam = T_new
+        self.calibrated = True
+
+        # Old drift samples are in the old calibration frame — clearing
+        # avoids smearing the alert across the calibration jump.
+        self._drift_history.clear()
+        self._drift_alert_active = False
+        self._publish_drift_alert(False)
+
+        t = T_new[:3, 3]
+        rz, ry, rx = rotation_matrix_to_euler_zyx(T_new[:3, :3])
+        header = "CALIBRATION COMPLETE" if was_first else "RECALIBRATED"
+        summary = (
+            f"{header} [{reason}] • "
+            f"t=({t[0]:.4f}, {t[1]:.4f}, {t[2]:.4f}) m • "
+            f"ZYX=({rz:.2f}, {ry:.2f}, {rx:.2f}) deg{delta_str}"
+        )
+        self.get_logger().info(f"=== {summary} ===")
+        if not was_first:
+            self.get_logger().warn(
+                "Downstream consumers (bone_cloud_mover, bone_peak_nav, "
+                "bone_scan_trajectory) now see a pose discontinuity — "
+                "re-lock any frozen targets.")
+        self._publish_calibration_status(
+            f"CALIBRATED • drift pending new samples{delta_str}")
+        return summary
+
+    def _handle_recalibrate(self, reason):
+        try:
+            summary = self._compute_calibration(reason)
+            return True, summary
+        except RuntimeError as e:
+            err = f"Recalibration failed: {e}"
+            self.get_logger().warn(err)
+            self._publish_calibration_status(f"RECALIBRATE FAILED • {e}")
+            return False, err
+
+    def _command_cb(self, msg):
+        cmd = (msg.data or "").strip().lower()
+        if cmd == "recalibrate":
+            self._handle_recalibrate("foxglove/command")
+        elif cmd == "reset_drift_alert":
+            self._drift_alert_active = False
+            self._drift_history.clear()
+            self._publish_drift_alert(False)
+            self.get_logger().info("Drift alert cleared by user.")
+        else:
+            self.get_logger().warn(
+                f"Unknown /ir_tracking/command: '{msg.data}' "
+                f"(expected 'recalibrate' or 'reset_drift_alert')")
+
+    def _recalibrate_srv_cb(self, request, response):
+        ok, summary = self._handle_recalibrate("service call")
+        response.success = ok
+        response.message = summary
+        return response
+
+    # ── Drift monitoring ─────────────────────────────────────────────────
+
+    def _update_drift_alert(self, now):
+        """Feed the latest drift sample into the rolling window and update
+        the latched alert + status. Called every frame from _poll_and_publish."""
+        if self._drift_m is None:
+            return
+
+        window = self._drift_alert_window_s
+        thresh = self._drift_alert_threshold_m
+        hist = self._drift_history
+        hist.append((now, self._drift_m))
+        cutoff = now - window
+        while hist and hist[0][0] < cutoff:
+            hist.popleft()
+
+        mean_drift_m = sum(d for (_, d) in hist) / len(hist)
+        span = hist[-1][0] - hist[0][0] if len(hist) > 1 else 0.0
+
+        # Not enough history yet — don't flip the alert on cold start.
+        if span < window:
+            self._publish_calibration_status(
+                f"CALIBRATED • drift {self._drift_m * 1000.0:.2f} mm "
+                f"(warming up {span:.1f}/{window:.1f} s)")
+            return
+
+        all_over = all(d >= thresh for (_, d) in hist)
+        all_under = all(d < thresh for (_, d) in hist)
+
+        if all_over and not self._drift_alert_active:
+            self._drift_alert_active = True
+            self._publish_drift_alert(True)
+            self.get_logger().warn(
+                f"Drift alert RAISED — sustained {mean_drift_m * 1000.0:.2f} mm "
+                f"over {span:.1f} s (threshold {thresh * 1000.0:.1f} mm)")
+        elif all_under and self._drift_alert_active:
+            # Only clear once the full window has dropped back under threshold
+            # — avoids flapping on borderline jitter.
+            self._drift_alert_active = False
+            self._publish_drift_alert(False)
+            self.get_logger().info("Drift alert cleared — drift back under threshold.")
+
+        if self._drift_alert_active:
+            text = (f"RECALIBRATE RECOMMENDED • "
+                    f"mean drift {mean_drift_m * 1000.0:.2f} mm for {span:.1f} s "
+                    f"(threshold {thresh * 1000.0:.1f} mm)")
+        else:
+            text = (f"CALIBRATED • drift {self._drift_m * 1000.0:.2f} mm "
+                    f"(mean {mean_drift_m * 1000.0:.2f} mm over {span:.1f} s)")
+        self._publish_calibration_status(text)
+
+    def _publish_drift_alert(self, active):
+        m = Bool()
+        m.data = bool(active)
+        self.drift_alert_pub.publish(m)
+
+    def _publish_calibration_status(self, text):
+        m = String()
+        m.data = text
+        self.calibration_status_pub.publish(m)
 
     # ── Periodic status log ──────────────────────────────────────────────
 
