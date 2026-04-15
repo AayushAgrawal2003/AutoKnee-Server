@@ -3,9 +3,13 @@ Panels:
     Help Height: 70
     Name: Displays
     Property Tree Widget:
-      Expanded: ~
+      Expanded:
+        - /TF1
+        - /Live Depth1
+        - /Tracked Femur1
+        - /Tracked Tibia1
       Splitter Ratio: 0.5
-    Tree Height: 442
+    Tree Height: 284
   - Class: rviz_common/Views
     Expanded:
       - /Current View1
@@ -14,9 +18,8 @@ Panels:
 Visualization Manager:
   Class: ""
   Displays:
-    # ── Grid (spatial reference) ──
-    - Alpha: 0.3
-      Cell Size: 0.1
+    - Alpha: 0.30000001192092896
+      Cell Size: 0.10000000149011612
       Class: rviz_default_plugins/Grid
       Color: 120; 120; 120
       Enabled: true
@@ -33,7 +36,6 @@ Visualization Manager:
       Plane Cell Count: 20
       Reference Frame: lbr_link_0
       Value: true
-    # ── Robot Model ──
     - Alpha: 1
       Class: rviz_default_plugins/RobotModel
       Collision Enabled: false
@@ -109,22 +111,114 @@ Visualization Manager:
       Update Interval: 0
       Value: true
       Visual Enabled: true
-    # ── TF Tree ──
     - Class: rviz_default_plugins/TF
       Enabled: true
       Frame Timeout: 15
       Frames:
         All Enabled: true
+        camera_aligned_depth_to_infra1_frame:
+          Value: true
+        camera_color_frame:
+          Value: true
+        camera_color_optical_frame:
+          Value: true
+        camera_depth_frame:
+          Value: true
+        camera_depth_optical_frame:
+          Value: true
+        camera_infra1_frame:
+          Value: true
+        camera_infra1_optical_frame:
+          Value: true
+        camera_infra2_frame:
+          Value: true
+        camera_infra2_optical_frame:
+          Value: true
+        camera_link:
+          Value: true
+        drill:
+          Value: true
+        lbr_floating_link:
+          Value: true
+        lbr_link_0:
+          Value: true
+        lbr_link_1:
+          Value: true
+        lbr_link_2:
+          Value: true
+        lbr_link_3:
+          Value: true
+        lbr_link_4:
+          Value: true
+        lbr_link_5:
+          Value: true
+        lbr_link_6:
+          Value: true
+        lbr_link_7:
+          Value: true
+        lbr_link_ee:
+          Value: true
+        tool_tip:
+          Value: true
+        tracked/femur_origin:
+          Value: true
+        tracked/tibia_origin:
+          Value: true
+        tracked_ee:
+          Value: true
+        tracked_femur:
+          Value: true
+        tracked_tibia:
+          Value: true
       Marker Scale: 0.20000000298023224
       Name: TF
       Show Arrows: false
       Show Axes: true
-      Show Names: false
+      Show Names: true
+      Tree:
+        lbr_floating_link:
+          lbr_link_0:
+            lbr_link_1:
+              lbr_link_2:
+                lbr_link_3:
+                  lbr_link_4:
+                    lbr_link_5:
+                      lbr_link_6:
+                        lbr_link_7:
+                          camera_link:
+                            camera_aligned_depth_to_infra1_frame:
+                              camera_infra1_optical_frame:
+                                {}
+                            camera_color_frame:
+                              camera_color_optical_frame:
+                                {}
+                            camera_depth_frame:
+                              camera_depth_optical_frame:
+                                {}
+                            camera_infra1_frame:
+                              {}
+                            camera_infra2_frame:
+                              camera_infra2_optical_frame:
+                                {}
+                          lbr_link_ee:
+                            drill:
+                              {}
+                          tool_tip:
+                            {}
+            tracked/femur_origin:
+              {}
+            tracked/tibia_origin:
+              {}
+            tracked_ee:
+              {}
+            tracked_femur:
+              {}
+            tracked_tibia:
+              {}
       Update Interval: 0
       Value: true
-    # ── Camera RGB ──
     - Class: rviz_default_plugins/Image
-      Enabled: true
+      Enabled: false
       Max Value: 1
       Median window: 5
       Min Value: 0
@@ -136,9 +230,8 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /camera_arm/camera/color/image_rect_raw
-      Value: true
-    # ── Live Depth PointCloud ──
-    - Alpha: 1
+      Value: false
+    - Alpha: 0.800000011920929
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
         Max Value: 10
@@ -149,7 +242,7 @@ Visualization Manager:
       Class: rviz_default_plugins/PointCloud2
       Color: 255; 255; 255
       Color Transformer: RGB8
-      Decay Time: 1
+      Decay Time: 0
       Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
@@ -160,7 +253,7 @@ Visualization Manager:
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 3
-      Size (m): 0.0001
+      Size (m): 0.0010000000474974513
       Style: Flat Squares
       Topic:
         Depth: 5
@@ -172,20 +265,17 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
-    # ══════════════════════════════════════════════════════════════════════
-    # IR TRACKER POSES (from ir_tracking_node)
-    # ══════════════════════════════════════════════════════════════════════
-    # ── Femur Tracker Pose ──
-    - Axes Length: 0.10000000149011612
+    - Alpha: 1
+      Axes Length: 0.10000000149011612
       Axes Radius: 0.009999999776482582
       Class: rviz_default_plugins/Pose
       Color: 255; 120; 0
       Enabled: true
-      Head Length: 0.015000000000000001
-      Head Radius: 0.007000000000000001
+      Head Length: 0.014999999664723873
+      Head Radius: 0.007000000216066837
       Name: Femur Tracker
-      Shaft Length: 0.05000000000000001
-      Shaft Radius: 0.004000000000000001
+      Shaft Length: 0.05000000074505806
+      Shaft Radius: 0.004000000189989805
       Shape: Axes
       Topic:
         Depth: 5
@@ -195,17 +285,17 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /kuka_frame/bone_pose_femur
       Value: true
-    # ── Tibia Tracker Pose ──
-    - Axes Length: 0.10000000149011612
+    - Alpha: 1
+      Axes Length: 0.10000000149011612
       Axes Radius: 0.009999999776482582
       Class: rviz_default_plugins/Pose
       Color: 0; 220; 100
       Enabled: true
-      Head Length: 0.015000000000000001
-      Head Radius: 0.007000000000000001
+      Head Length: 0.014999999664723873
+      Head Radius: 0.007000000216066837
       Name: Tibia Tracker
-      Shaft Length: 0.05000000000000001
-      Shaft Radius: 0.004000000000000001
+      Shaft Length: 0.05000000074505806
+      Shaft Radius: 0.004000000189989805
       Shape: Axes
       Topic:
         Depth: 5
@@ -215,17 +305,17 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /kuka_frame/bone_pose_tibia
       Value: true
-    # ── EE Tracker Pose (IR) ──
-    - Axes Length: 0.10000000149011612
+    - Alpha: 1
+      Axes Length: 0.10000000149011612
       Axes Radius: 0.009999999776482582
       Class: rviz_default_plugins/Pose
       Color: 0; 150; 255
       Enabled: true
-      Head Length: 0.015000000000000001
-      Head Radius: 0.007000000000000001
+      Head Length: 0.014999999664723873
+      Head Radius: 0.007000000216066837
       Name: EE Tracker (IR)
-      Shaft Length: 0.05000000000000001
-      Shaft Radius: 0.004000000000000001
+      Shaft Length: 0.05000000074505806
+      Shaft Radius: 0.004000000189989805
       Shape: Axes
       Topic:
         Depth: 5
@@ -235,12 +325,7 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /kuka_frame/pose_ee
       Value: true
-    # ══════════════════════════════════════════════════════════════════════
-    # TRACKED BONE CLOUDS (/tracked/*) — live output from bone_cloud_mover
-    # bone_cloud_mover publishes one topic per bone: /tracked/{bone}
-    # ══════════════════════════════════════════════════════════════════════
-    # ── Tracked Femur ──
-    - Alpha: 1
+    - Alpha: 0.5
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
         Max Value: 10
@@ -262,7 +347,7 @@ Visualization Manager:
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 3
-      Size (m): 0.003000000026077032
+      Size (m): 0.0020000000949949026
       Style: Flat Squares
       Topic:
         Depth: 5
@@ -274,8 +359,7 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: false
       Value: true
-    # ── Tracked Tibia ──
-    - Alpha: 1
+    - Alpha: 0.5
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
         Max Value: 10
@@ -297,7 +381,7 @@ Visualization Manager:
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 3
-      Size (m): 0.003000000026077032
+      Size (m): 0.0020000000949949026
       Style: Flat Squares
       Topic:
         Depth: 5
@@ -309,13 +393,7 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: false
       Value: true
-    # ══════════════════════════════════════════════════════════════════════
-    # STATIC CLOUDS (latched, set once after ICP — disabled by default)
-    #   /bone_scan/*  — filtered+denoised camera scan clouds
-    #   /bone_model/* — ICP-aligned reference PLY (model moved to match scan)
-    # ══════════════════════════════════════════════════════════════════════
-    # ── Bone Scan Tibia (static) ──
-    - Alpha: 0.6
+    - Alpha: 0.6000000238418579
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
         Max Value: 10
@@ -349,8 +427,7 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: false
       Value: false
-    # ── Bone Model Tibia (static) ──
-    - Alpha: 0.3
+    - Alpha: 0.30000001192092896
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
         Max Value: 10
@@ -384,8 +461,7 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: false
       Value: false
-    # ── Bone Scan Femur (static) ──
-    - Alpha: 0.6
+    - Alpha: 0.6000000238418579
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
         Max Value: 10
@@ -419,8 +495,7 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: false
       Value: false
-    # ── Bone Model Femur (static) ──
-    - Alpha: 0.3
+    - Alpha: 0.30000001192092896
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
         Max Value: 10
@@ -454,6 +529,36 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: false
       Value: false
+    - Class: rviz_default_plugins/Camera
+      Enabled: true
+      Far Plane Distance: 100
+      Image Rendering: background and overlay
+      Name: Camera
+      Overlay Alpha: 0.5
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /camera_arm/camera/color/image_rect_raw
+      Value: true
+      Visibility:
+        Bone Model Femur (static): true
+        Bone Model Tibia (static): true
+        Bone Scan Femur (static): true
+        Bone Scan Tibia (static): true
+        Camera RGB: true
+        EE Tracker (IR): true
+        Femur Tracker: true
+        Grid: true
+        Live Depth: true
+        Robot Model: true
+        TF: true
+        Tibia Tracker: true
+        Tracked Femur: true
+        Tracked Tibia: true
+        Value: true
+      Zoom Factor: 1
   Enabled: true
   Global Options:
     Background Color: 35; 35; 35
@@ -492,27 +597,29 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 2.5
+      Distance: 2.064774513244629
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0
-        Y: 0
-        Z: 0.5
+        X: -0.34228435158729553
+        Y: 0.21585050225257874
+        Z: 0.2678006589412689
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.30000001192092896
+      Pitch: 0.25499996542930603
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz_default_plugins)
-      Yaw: 1.5699999332427979
+      Yaw: 3.370002031326294
     Saved: ~
 Window Geometry:
+  Camera:
+    collapsed: false
   Camera RGB:
     collapsed: false
   Displays:
@@ -520,7 +627,7 @@ Window Geometry:
   Height: 946
   Hide Left Dock: false
   Hide Right Dock: false
-  QMainWindow State: 000000ff00000000fd0000000100000000000002b400000358fc0200000006fb0000001800430061006d006500720061002000440065007000740068010000003d0000002a0000000000000000fb0000001400430061006d0065007200610020005200470042010000003d000001150000002800fffffffb00000046004d006f00740069006f006e00200050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000000000000000fb0000001e004d006f00740069006f006e00200050006c0061006e006e0069006e0067010000003d000002300000000000000000fb000000100044006900730070006c00610079007301000001580000023d000000c900fffffffb0000000a0056006900650077007300000002dd000000b8000000a400ffffff000004c60000035800000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd00000001000000000000040700000358fc0200000007fb0000001800430061006d006500720061002000440065007000740068010000003d0000002a0000000000000000fb0000001400430061006d0065007200610020005200470042000000003d000000d20000002800fffffffb00000046004d006f00740069006f006e00200050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000000000000000fb0000001e004d006f00740069006f006e00200050006c0061006e006e0069006e0067010000003d000002300000000000000000fb000000100044006900730070006c006100790073010000003d0000019f000000c900fffffffb0000000a0056006900650077007300000002dd000000b8000000a400fffffffb0000000c00430061006d00650072006101000001e2000001b30000002800ffffff000003730000035800000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
     collapsed: false
   Width: 1920

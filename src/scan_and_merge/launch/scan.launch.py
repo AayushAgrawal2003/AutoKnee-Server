@@ -176,6 +176,9 @@ def generate_launch_description():
                               description="Path to T_ref_to_tracker .npy for femur (multi-orient calibration)"),
 
         # ── Arguments: Multi-orientation calibration ──
+        DeclareLaunchArgument("init_registration_dir", default_value="",
+                              description="Pre-load a saved session folder as orientation 0 "
+                                          "(must contain T_tracker/T_icp .npy files)"),
         DeclareLaunchArgument("multi_orientation", default_value="true",
                               description="Enable multi-orientation ICP calibration mode"),
         DeclareLaunchArgument("n_orientations", default_value="4",
@@ -290,9 +293,14 @@ def generate_launch_description():
                         {   # CLI overrides
                             "load_waypoints": load_waypoints,
                             "velocity_scaling": velocity_scaling,
+                            "weights": weights,
+                            "target_classes": target_classes,
+                            "confidence": confidence,
+                            "use_seg_mask": use_seg_mask,
                             "multi_orientation": multi_orientation,
                             "n_orientations": n_orientations,
                             "perpendicular_adjust": perpendicular_adjust,
+                            "init_registration_dir": LaunchConfiguration("init_registration_dir"),
                         },
                     ],
                 ),

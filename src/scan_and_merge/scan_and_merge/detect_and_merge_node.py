@@ -155,8 +155,10 @@ class DetectAndMergeNode(Node):
         self.get_logger().info("=== Detect & Merge Node Starting ===")
 
         # ── Parameters ──
-        self.declare_parameter("load_waypoints", "")
-        self.declare_parameter("weights", "")
+        self.declare_parameter("load_waypoints",
+            os.path.expanduser("~/scan_output/waypoints.npy"))
+        self.declare_parameter("weights",
+            os.path.expanduser("~/scan_output/best.pt"))
         self.declare_parameter("target_classes", "",
                               ParameterDescriptor(
                                   description="Comma-sep class IDs or JSON list (empty=all)",
@@ -202,18 +204,8 @@ class DetectAndMergeNode(Node):
 
         self.declare_parameter("icp_voxel_size", 0.002)
 
-        """
-        General Good registration saved here for scans
-        ~/detect_output/tibia_icp_T_ref2base_20260227_201636.npy
-        ~/detect_output/femur_icp_T_ref2base_20260227_201636.npy
-        
-        For Full bone
-        
-        
-        """
-
-        self.declare_parameter("tibia_init_transform", "")  # path to .npy 4x4
-        self.declare_parameter("femur_init_transform", "")  # path to .npy 4x4
+        self.declare_parameter("tibia_init_transform", "")  # path to .npy 4x4, optional ICP hint
+        self.declare_parameter("femur_init_transform", "")  # path to .npy 4x4, optional ICP hint
 
         # If set, a previously-saved round folder is loaded as orientation 0
         # (skipping its live scan). Folder must contain T_tracker_{tibia,femur}.npy
@@ -452,6 +444,10 @@ class DetectAndMergeNode(Node):
         self.init_registration_dir = os.path.expanduser(
             self.get_parameter("init_registration_dir").get_parameter_value().string_value
         )
+        self.get_logger().info(
+            f"  init_registration_dir: '{self.init_registration_dir}' "
+            f"({'EXISTS' if self.init_registration_dir and os.path.isdir(self.init_registration_dir) else 'not set or missing'})"
+        )
 
         # Perpendicular view adjustment params
         self.perpendicular_adjust = self.get_parameter("perpendicular_adjust").get_parameter_value().bool_value
@@ -647,6 +643,9 @@ class DetectAndMergeNode(Node):
 
         # ── Optional: pre-load a saved round folder as orientation 0 ──
         if self.init_registration_dir:
+            self.get_logger().info(
+                f"  [init_reg] Attempting to load orientation 0 from: {self.init_registration_dir}"
+            )
             init_loaded = self._load_init_registration(
                 self.init_registration_dir, orientation_data
             )
@@ -873,6 +872,7 @@ class DetectAndMergeNode(Node):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         frame_id = BASE_FRAME
         report = {}
+        errors_log = {}
         # session_dir is created at the start of _run_multi_orientation_workflow;
         # fall back to OUTPUT_DIR for robustness if somehow unset.
         out_dir = getattr(self, "session_dir", None) or OUTPUT_DIR
@@ -934,10 +934,8 @@ class DetectAndMergeNode(Node):
                 os.path.join(out_dir, f"T_icp_{bone_name}.npy"),
                 T_icp_consistent,
             )
-            np.save(
-                os.path.join(out_dir, f"T_ref_to_tracker_{bone_name}.npy"),
-                T_ref_to_tracker,
-            )
+            cal_path = os.path.join(out_dir, f"T_ref_to_tracker_{bone_name}.npy")
+            np.save(cal_path, T_ref_to_tracker)
             self.get_logger().info(
                 f"  Saved solved calibration ({bone_name}) to {out_dir}"
             )
@@ -964,6 +962,32 @@ class DetectAndMergeNode(Node):
                 "mean_rot_deg": val["mean_rot_deg"],
                 "residuals": val["residuals"],
                 "calibration_file": cal_path,
+            }
+
+            # Build per-orientation error log combining ICP metrics + LS residuals
+            rejected_set = set(result["rejected_indices"])
+            active_residuals_iter = iter(val["residuals"])
+            ori_entries = []
+            for i, ori in enumerate(oris):
+                entry = {
+                    "orientation_idx": int(ori["orientation_idx"]),
+                    "kept": i not in rejected_set,
+                    "icp_fitness": float(ori["fitness"]),
+                    "icp_rmse": float(ori["rmse"]),
+                    "ls_residual_trans_mm": None,
+                    "ls_residual_rot_deg": None,
+                }
+                if i not in rejected_set:
+                    res = next(active_residuals_iter)
+                    entry["ls_residual_trans_mm"] = float(res["trans_mm"])
+                    entry["ls_residual_rot_deg"] = float(res["rot_deg"])
+                ori_entries.append(entry)
+
+            errors_log[bone_name] = {
+                "orientations": ori_entries,
+                "mean_trans_mm": float(val["mean_trans_mm"]),
+                "mean_rot_deg": float(val["mean_rot_deg"]),
+                "rejected_indices": result["rejected_indices"],
             }
 
             # Publish model-frame reference points for bone_cloud_mover
@@ -1006,6 +1030,12 @@ class DetectAndMergeNode(Node):
         with open(report_path, "w") as f:
             json.dump(safe_report, f, indent=2)
         self.get_logger().info(f"  Report saved: {report_path}")
+
+        errors_path = os.path.join(out_dir, "errors_and_residuals.json")
+        safe_errors = json.loads(json.dumps(errors_log, default=_json_safe))
+        with open(errors_path, "w") as f:
+            json.dump(safe_errors, f, indent=2)
+        self.get_logger().info(f"  Errors log saved: {errors_path}")
 
         self._publish_mo_status(
             f"MULTI-ORIENTATION CALIBRATION COMPLETE. "
@@ -1997,6 +2027,13 @@ class DetectAndMergeNode(Node):
                 continue
             T_tracker = np.load(tt)
             T_icp = np.load(ti)
+            t_tracker_t = T_tracker[:3, 3]
+            t_icp_t = T_icp[:3, 3]
+            self.get_logger().info(
+                f"  [init_reg] {bone_name}: "
+                f"T_tracker t=[{t_tracker_t[0]:.3f},{t_tracker_t[1]:.3f},{t_tracker_t[2]:.3f}]  "
+                f"T_icp t=[{t_icp_t[0]:.3f},{t_icp_t[1]:.3f},{t_icp_t[2]:.3f}]"
+            )
             orientation_data[bone_name].append({
                 "T_tracker": T_tracker.copy(),
                 "T_icp": T_icp.copy(),
