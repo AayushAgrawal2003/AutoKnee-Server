@@ -215,6 +215,11 @@ class DetectAndMergeNode(Node):
         self.declare_parameter("tibia_init_transform", "")  # path to .npy 4x4
         self.declare_parameter("femur_init_transform", "")  # path to .npy 4x4
 
+        # If set, a previously-saved round folder is loaded as orientation 0
+        # (skipping its live scan). Folder must contain T_tracker_{tibia,femur}.npy
+        # and T_icp_{tibia,femur}.npy — i.e. anything _save_round() wrote.
+        self.declare_parameter("init_registration_dir", "")
+
         # self.declare_parameter("tibia_init_transform", "~/detect_output/tibia_icp_T_ref2base_20260227_202247.npy")  # path to .npy 4x4
         # self.declare_parameter("femur_init_transform", "~/detect_output/femur_icp_T_ref2base_20260227_202247.npy")  # path to .npy 4x4
 
@@ -314,6 +319,12 @@ class DetectAndMergeNode(Node):
         #                     the global placement of the PLY model origin
         self._icp_tf_pub_tibia = self.create_publisher(Float64MultiArray, "/icp_transform/tibia", latch_qos)
         self._icp_tf_pub_femur = self.create_publisher(Float64MultiArray, "/icp_transform/femur", latch_qos)
+
+        # /session/dir — absolute path of the current session folder.
+        # Latched so late subscribers (e.g. ir_tracking_node) pick it up
+        # as soon as they connect and redirect their own logs into it.
+        self._session_dir_pub = self.create_publisher(
+            String, "/session/dir", latch_qos)
 
         # ── Output dirs ──
         self.det_dir = os.path.join(OUTPUT_DIR, "detections")
@@ -438,6 +449,9 @@ class DetectAndMergeNode(Node):
         self.multi_orientation = self.get_parameter("multi_orientation").get_parameter_value().bool_value
         self.n_orientations = self.get_parameter("n_orientations").get_parameter_value().integer_value
         self.tracker_avg_samples = self.get_parameter("tracker_avg_samples").get_parameter_value().integer_value
+        self.init_registration_dir = os.path.expanduser(
+            self.get_parameter("init_registration_dir").get_parameter_value().string_value
+        )
 
         # Perpendicular view adjustment params
         self.perpendicular_adjust = self.get_parameter("perpendicular_adjust").get_parameter_value().bool_value
@@ -611,6 +625,18 @@ class DetectAndMergeNode(Node):
         # so at most one entry per bone at any time.
         accumulated_clouds = {"bone_left": [], "bone_right": []}
 
+        # ── Per-session output folder (holds round_NN/ subfolders) ──
+        session_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.session_dir = os.path.join(OUTPUT_DIR, f"session_{session_ts}")
+        os.makedirs(self.session_dir, exist_ok=True)
+        self.get_logger().info(f"  Session dir: {self.session_dir}")
+
+        # Broadcast session_dir so other nodes (ir_tracking drift logger etc.)
+        # can redirect their outputs into the same folder.
+        sess_msg = String()
+        sess_msg.data = self.session_dir
+        self._session_dir_pub.publish(sess_msg)
+
         self._publish_mo_status(
             f"MULTI-ORIENTATION MODE: {self.n_orientations} orientations planned. "
             f"Commands: publish to /multi_orient/command"
@@ -618,6 +644,29 @@ class DetectAndMergeNode(Node):
 
         orientation_idx = 0
         done = False
+
+        # ── Optional: pre-load a saved round folder as orientation 0 ──
+        if self.init_registration_dir:
+            init_loaded = self._load_init_registration(
+                self.init_registration_dir, orientation_data
+            )
+            if init_loaded:
+                self._publish_mo_status(
+                    f"Loaded init registration from {self.init_registration_dir} "
+                    f"as orientation 1. Reposition bones and publish 'ready' "
+                    f"for orientation 2, or 'solve' to finish now."
+                )
+                orientation_idx = 1
+                if orientation_idx >= self.n_orientations:
+                    done = True
+                else:
+                    cmd = self._mo_helper.wait_command("ready", "solve")
+                    self.get_logger().info(
+                        f"  [multi_orient] Got command: '{cmd}'"
+                    )
+                    if cmd == "solve":
+                        done = True
+                    self._mo_helper.clear_poses()
 
         while orientation_idx < self.n_orientations and not done:
             self._publish_mo_status(
@@ -820,10 +869,13 @@ class DetectAndMergeNode(Node):
         self._run_multi_orient_solve(orientation_data)
 
     def _run_multi_orient_solve(self, orientation_data):
-        """Run the least-squares solver and save results."""
+        """Run the least-squares solver and save results under session_dir."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         frame_id = BASE_FRAME
         report = {}
+        # session_dir is created at the start of _run_multi_orientation_workflow;
+        # fall back to OUTPUT_DIR for robustness if somehow unset.
+        out_dir = getattr(self, "session_dir", None) or OUTPUT_DIR
 
         for bone_name in ["tibia", "femur"]:
             oris = orientation_data[bone_name]
@@ -866,12 +918,29 @@ class DetectAndMergeNode(Node):
                     f"trans={r['trans_mm']:.2f}mm, rot={r['rot_deg']:.2f}deg{flag}"
                 )
 
-            # Save calibration
-            cal_path = os.path.join(
-                OUTPUT_DIR, f"T_ref_to_tracker_{bone_name}_{timestamp}.npy"
+            # ── Save the solved calibration in loader-compatible format ──
+            # Loader expects T_tracker_{bone}.npy + T_icp_{bone}.npy such that
+            # inv(T_tracker) @ T_icp = T_ref_to_tracker. We pick the most recent
+            # orientation's T_tracker as the anchor and derive a matching T_icp
+            # so the saved folder reproduces the *solved* result when re-loaded.
+            T_tracker_anchor = oris[-1]["T_tracker"]
+            T_icp_consistent = T_tracker_anchor @ T_ref_to_tracker
+
+            np.save(
+                os.path.join(out_dir, f"T_tracker_{bone_name}.npy"),
+                T_tracker_anchor,
             )
-            np.save(cal_path, T_ref_to_tracker)
-            self.get_logger().info(f"  Saved calibration: {cal_path}")
+            np.save(
+                os.path.join(out_dir, f"T_icp_{bone_name}.npy"),
+                T_icp_consistent,
+            )
+            np.save(
+                os.path.join(out_dir, f"T_ref_to_tracker_{bone_name}.npy"),
+                T_ref_to_tracker,
+            )
+            self.get_logger().info(
+                f"  Saved solved calibration ({bone_name}) to {out_dir}"
+            )
 
             # Publish calibration to bone_cloud_mover for immediate use
             cal_msg = Float64MultiArray()
@@ -884,11 +953,8 @@ class DetectAndMergeNode(Node):
                 f"  Published live calibration for {bone_name} to bone_cloud_mover"
             )
 
-            # Save orientation data
-            ori_path = os.path.join(
-                OUTPUT_DIR, f"multi_orient_{bone_name}_{timestamp}.npy"
-            )
-            np.save(ori_path, oris, allow_pickle=True)
+            # (Per-round folders already contain each orientation's T_tracker,
+            # T_icp, and scans — no need to re-dump the full orientation list.)
 
             report[bone_name] = {
                 "n_orientations": len(oris),
@@ -925,9 +991,7 @@ class DetectAndMergeNode(Node):
                     )
 
         # Save report
-        report_path = os.path.join(
-            OUTPUT_DIR, f"multi_orient_report_{timestamp}.json"
-        )
+        report_path = os.path.join(out_dir, "report.json")
         # Convert numpy types for JSON
         def _json_safe(obj):
             if isinstance(obj, np.ndarray):
@@ -945,7 +1009,7 @@ class DetectAndMergeNode(Node):
 
         self._publish_mo_status(
             f"MULTI-ORIENTATION CALIBRATION COMPLETE. "
-            f"Calibration files saved to {OUTPUT_DIR}"
+            f"Calibration files saved to {out_dir}"
         )
 
     # ──────────────────────────────────────────────────────────────────
@@ -995,10 +1059,11 @@ class DetectAndMergeNode(Node):
             self.get_logger().info(f"  No detections at {label}, skipping.")
             return
 
-        # ── Save annotated image ──
-        annotated = results.plot()
-        det_path = os.path.join(self.det_dir, f"det_{label}_{timestamp}.png")
-        cv2.imwrite(det_path, annotated)
+        # ── Save annotated image (single-orientation debug only) ──
+        if not self.multi_orientation:
+            annotated = results.plot()
+            det_path = os.path.join(self.det_dir, f"det_{label}_{timestamp}.png")
+            cv2.imwrite(det_path, annotated)
 
         # ── Filter to target classes ──
         filtered = []
@@ -1080,17 +1145,18 @@ class DetectAndMergeNode(Node):
                 f"    {inst_label}: {len(points_cam)} points"
             )
 
-            # ── Save per-instance cloud ──
-            cloud_file = os.path.join(
-                self.cloud_dir, f"cloud_{inst_label}_{timestamp}.npy"
-            )
-            save_dict = {"points": points_cam.astype(np.float32)}
-            if colors is not None:
-                save_dict["colors"] = colors.astype(np.float32)
-            if rotation is not None and translation is not None:
-                save_dict["rotation"] = rotation.astype(np.float64)
-                save_dict["translation"] = translation.astype(np.float64)
-            np.save(cloud_file, save_dict)
+            # ── Save per-instance cloud (single-orientation debug only) ──
+            if not self.multi_orientation:
+                cloud_file = os.path.join(
+                    self.cloud_dir, f"cloud_{inst_label}_{timestamp}.npy"
+                )
+                save_dict = {"points": points_cam.astype(np.float32)}
+                if colors is not None:
+                    save_dict["colors"] = colors.astype(np.float32)
+                if rotation is not None and translation is not None:
+                    save_dict["rotation"] = rotation.astype(np.float64)
+                    save_dict["translation"] = translation.astype(np.float64)
+                np.save(cloud_file, save_dict)
 
             # ── Store for merge, keyed by bone_name ──
             if rotation is not None and translation is not None:
@@ -1573,8 +1639,8 @@ class DetectAndMergeNode(Node):
                 f"  {bone_id} raw: {len(merged)} pts from {len(entries)} views"
             )
 
-            # Save raw
-            if HAS_OPEN3D:
+            # Save raw (single-orientation debug only)
+            if HAS_OPEN3D and not self.multi_orientation:
                 pcd = o3d.geometry.PointCloud()
                 pcd.points = o3d.utility.Vector3dVector(merged)
                 if merged_c is not None:
@@ -1615,7 +1681,11 @@ class DetectAndMergeNode(Node):
                 verbose=True,
             )
 
-            # Save denoised per-bone
+            # Store for registration phase
+            self.denoise_results = results
+
+            # Log per-bone summary; multi-orientation mode saves per-round folders
+            # (see _save_round). Single-orientation mode still writes flat files.
             for bone_id in ["bone_left", "bone_right"]:
                 if bone_id not in results:
                     continue
@@ -1623,6 +1693,9 @@ class DetectAndMergeNode(Node):
                 cols = results[bone_id]["colors"]
 
                 self.get_logger().info(f"  {bone_id} clean: {len(pts)} pts")
+
+                if self.multi_orientation:
+                    continue
 
                 npy_path = os.path.join(OUTPUT_DIR, f"{bone_id}_clean_{timestamp}.npy")
                 save_dict = {"points": pts.astype(np.float32)}
@@ -1639,11 +1712,8 @@ class DetectAndMergeNode(Node):
                     o3d.io.write_point_cloud(ply_path, pcd)
                     self.get_logger().info(f"  Saved: {ply_path}")
 
-            # Store for registration phase
-            self.denoise_results = results
-
-            # Save combined denoised
-            if "combined" in results:
+            # Save combined denoised (single-orientation only)
+            if "combined" in results and not self.multi_orientation:
                 pts = results["combined"]["points"]
                 cols = results["combined"]["colors"]
 
@@ -1665,33 +1735,34 @@ class DetectAndMergeNode(Node):
                     self.get_logger().info(f"  Saved: {ply_path}")
 
         else:
-            # No denoise — just merge and save as before
-            all_points = []
-            all_colors = []
-            for bone_id in ["bone_left", "bone_right"]:
-                for entry in by_bone.get(bone_id, []):
-                    pts = entry["points_cam"]
-                    rot = entry["rotation"]
-                    trans = entry["translation"]
-                    transformed = (rot @ pts.T).T + trans
-                    all_points.append(transformed)
-                    if entry["colors"] is not None:
-                        all_colors.append(entry["colors"])
+            # No denoise — single-orientation debug path writes a merged file.
+            if not self.multi_orientation:
+                all_points = []
+                all_colors = []
+                for bone_id in ["bone_left", "bone_right"]:
+                    for entry in by_bone.get(bone_id, []):
+                        pts = entry["points_cam"]
+                        rot = entry["rotation"]
+                        trans = entry["translation"]
+                        transformed = (rot @ pts.T).T + trans
+                        all_points.append(transformed)
+                        if entry["colors"] is not None:
+                            all_colors.append(entry["colors"])
 
-            if all_points:
-                merged_pts = np.vstack(all_points)
-                merged_cols = np.vstack(all_colors) if all_colors else None
-                npy_path = os.path.join(OUTPUT_DIR, f"detected_merged_{timestamp}.npy")
-                np.save(npy_path, {"points": merged_pts.astype(np.float32),
-                                    "colors": merged_cols.astype(np.float32) if merged_cols is not None else None})
-                if HAS_OPEN3D:
-                    pcd = o3d.geometry.PointCloud()
-                    pcd.points = o3d.utility.Vector3dVector(merged_pts)
-                    if merged_cols is not None:
-                        pcd.colors = o3d.utility.Vector3dVector(merged_cols)
-                    ply_path = os.path.join(OUTPUT_DIR, f"detected_merged_{timestamp}.ply")
-                    o3d.io.write_point_cloud(ply_path, pcd)
-                    self.get_logger().info(f"  Saved: {ply_path}")
+                if all_points:
+                    merged_pts = np.vstack(all_points)
+                    merged_cols = np.vstack(all_colors) if all_colors else None
+                    npy_path = os.path.join(OUTPUT_DIR, f"detected_merged_{timestamp}.npy")
+                    np.save(npy_path, {"points": merged_pts.astype(np.float32),
+                                        "colors": merged_cols.astype(np.float32) if merged_cols is not None else None})
+                    if HAS_OPEN3D:
+                        pcd = o3d.geometry.PointCloud()
+                        pcd.points = o3d.utility.Vector3dVector(merged_pts)
+                        if merged_cols is not None:
+                            pcd.colors = o3d.utility.Vector3dVector(merged_cols)
+                        ply_path = os.path.join(OUTPUT_DIR, f"detected_merged_{timestamp}.ply")
+                        o3d.io.write_point_cloud(ply_path, pcd)
+                        self.get_logger().info(f"  Saved: {ply_path}")
 
     # ──────────────────────────────────────────────────────────────────
     # ICP Registration
@@ -1796,19 +1867,21 @@ class DetectAndMergeNode(Node):
             else:
                 self._icp_tf_pub_femur.publish(icp_tf_msg)
 
-            # Save transform + aligned reference PLY
-            np.save(
-                os.path.join(OUTPUT_DIR, f"{bone_name}_icp_T_ref2base_{timestamp}.npy"),
-                T_ref_to_base,
-            )
-            if HAS_OPEN3D:
-                pcd = o3d.geometry.PointCloud()
-                pcd.points = o3d.utility.Vector3dVector(aligned_ref_pts)
-                if aligned_ref_cols is not None:
-                    pcd.colors = o3d.utility.Vector3dVector(aligned_ref_cols)
-                ref_path_out = os.path.join(OUTPUT_DIR, f"{bone_name}_ref_in_base_{timestamp}.ply")
-                o3d.io.write_point_cloud(ref_path_out, pcd)
-                self.get_logger().info(f"  Saved: {ref_path_out}")
+            # Save transform + aligned reference PLY (single-orientation only;
+            # multi-orientation mode persists these via _save_round per round).
+            if not self.multi_orientation:
+                np.save(
+                    os.path.join(OUTPUT_DIR, f"{bone_name}_icp_T_ref2base_{timestamp}.npy"),
+                    T_ref_to_base,
+                )
+                if HAS_OPEN3D:
+                    pcd = o3d.geometry.PointCloud()
+                    pcd.points = o3d.utility.Vector3dVector(aligned_ref_pts)
+                    if aligned_ref_cols is not None:
+                        pcd.colors = o3d.utility.Vector3dVector(aligned_ref_cols)
+                    ref_path_out = os.path.join(OUTPUT_DIR, f"{bone_name}_ref_in_base_{timestamp}.ply")
+                    o3d.io.write_point_cloud(ref_path_out, pcd)
+                    self.get_logger().info(f"  Saved: {ref_path_out}")
 
             # Load vis reference and apply same transform for publishing
             vis_path = self.tibia_vis_path if bone_name == "tibia" else self.femur_vis_path
@@ -1894,6 +1967,53 @@ class DetectAndMergeNode(Node):
         with open(path, "w") as f:
             json.dump(manifest, f, indent=2)
         self.get_logger().info(f"  Manifest: {path}")
+
+    # ──────────────────────────────────────────────────────────────────
+    # Init-registration load (multi-orientation mode)
+    # ──────────────────────────────────────────────────────────────────
+    def _load_init_registration(self, path, orientation_data):
+        """Load a previously-saved session folder as orientation 1.
+
+        Expects T_tracker_{tibia,femur}.npy + T_icp_{tibia,femur}.npy in `path`
+        (the layout _save_round writes). Populates orientation_data in place.
+
+        Returns True if at least one bone was loaded.
+        """
+        if not path or not os.path.isdir(path):
+            self.get_logger().warn(
+                f"  init_registration_dir not a directory: {path}"
+            )
+            return False
+
+        loaded = []
+        for bone_name in ["tibia", "femur"]:
+            tt = os.path.join(path, f"T_tracker_{bone_name}.npy")
+            ti = os.path.join(path, f"T_icp_{bone_name}.npy")
+            if not (os.path.exists(tt) and os.path.exists(ti)):
+                self.get_logger().warn(
+                    f"  init_registration_dir missing {bone_name} files "
+                    f"(need T_tracker_{bone_name}.npy and T_icp_{bone_name}.npy)"
+                )
+                continue
+            T_tracker = np.load(tt)
+            T_icp = np.load(ti)
+            orientation_data[bone_name].append({
+                "T_tracker": T_tracker.copy(),
+                "T_icp": T_icp.copy(),
+                # User-supplied pair — treat as ideal for solver weighting.
+                "fitness": 1.0,
+                "rmse": 0.0,
+                "orientation_idx": 0,
+            })
+            loaded.append(bone_name)
+
+        if not loaded:
+            return False
+
+        self.get_logger().info(
+            f"  Loaded init registration for {loaded} from {path}"
+        )
+        return True
 
     @staticmethod
     def _resolve_ref_path(path, pkg_share):

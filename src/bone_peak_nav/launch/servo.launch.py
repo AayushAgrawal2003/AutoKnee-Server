@@ -25,6 +25,11 @@ def generate_launch_description():
         DeclareLaunchArgument("num_planning_attempts", default_value="5"),
         DeclareLaunchArgument("tracking_rate_hz", default_value="2.0"),
         DeclareLaunchArgument("movement_threshold_m", default_value="0.0003"),
+        DeclareLaunchArgument(
+            "goto_pose_input_topic",
+            default_value="/surgical_plan/probe_pose",
+            description="Topic goto_pose_node subscribes to for target poses",
+        ),
 
         Node(
             package="bone_peak_nav",
@@ -49,5 +54,16 @@ def generate_launch_description():
             output="screen",
             respawn=True,
             respawn_delay=1.0,
+        ),
+
+        # Go-to-target-pose node — listens on goto_pose_input_topic for a
+        # PoseStamped, then executes on 'go' command via /goto_pose/command.
+        Node(
+            package="scan_and_merge",
+            executable="goto_pose_node",
+            output="screen",
+            parameters=[{
+                "input_topic": LaunchConfiguration("goto_pose_input_topic"),
+            }],
         ),
     ])

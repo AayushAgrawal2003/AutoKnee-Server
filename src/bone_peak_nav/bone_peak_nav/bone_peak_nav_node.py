@@ -17,6 +17,7 @@ Drill alignment logic mirrors bone_scan_trajectory.normal_to_drill_quat
 with normal = [0, 0, 1]: drill-Z = -normal = world-down.
 """
 
+import os
 import threading
 import time
 import numpy as np
@@ -192,6 +193,14 @@ class BonePeakNavNode(Node):
         self.declare_parameter("tracking_rate_hz", 1.0)
         self.declare_parameter("movement_threshold_m", 0.001)
         self.declare_parameter("pause_topic", "/pedal_press")
+        # Tip-error logging: sample rate and fallback directory used until
+        # /session/dir arrives from detect_and_merge_node.
+        self.declare_parameter("tip_error_rate_hz", 10.0)
+        self.declare_parameter(
+            "tip_error_log_dir",
+            os.path.expanduser("~/detect_output"),
+        )
+        self.declare_parameter("tip_error_flush_every", 25)
 
         self.standoff = float(self.get_parameter("standoff_distance").value)
         self.velocity = float(self.get_parameter("velocity_scaling").value)
@@ -292,6 +301,45 @@ class BonePeakNavNode(Node):
         self.create_timer(0.5, self._publish_peaks_timer,
                           callback_group=self.cb_group)
 
+        # ── Tip-error log ─────────────────────────────────────────────
+        # Opens a pending file in the fallback dir immediately, then
+        # hot-swaps into session_dir/tip_error.tsv when /session/dir
+        # arrives from detect_and_merge_node. Buffered writes: flushes
+        # once per tip_error_flush_every samples (and on shutdown).
+        tip_log_dir = os.path.expanduser(
+            str(self.get_parameter("tip_error_log_dir").value))
+        os.makedirs(tip_log_dir, exist_ok=True)
+        pending_name = time.strftime("tip_error_pending_%Y%m%d_%H%M%S.tsv")
+        self._tip_error_log_path = os.path.join(tip_log_dir, pending_name)
+        self._tip_error_log_file = open(self._tip_error_log_path, "w")
+        self._tip_error_log_file.write(
+            "# ros_time_s\tbone\ttarget_x_mm\ttarget_y_mm\ttarget_z_mm"
+            "\tdrill_x_mm\tdrill_y_mm\tdrill_z_mm\terr_mm\n"
+        )
+        self._tip_error_log_file.flush()
+        self._tip_error_buffer = []
+        self._tip_error_flush_every = int(
+            self.get_parameter("tip_error_flush_every").value)
+        self.get_logger().info(
+            f"Logging tip error to {self._tip_error_log_path} "
+            f"(will redirect when /session/dir arrives)")
+
+        session_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        self.create_subscription(
+            String, "/session/dir", self._session_dir_cb, session_qos,
+            callback_group=self.cb_group,
+        )
+
+        # Sampling timer for tip-vs-target error.
+        tip_rate = float(self.get_parameter("tip_error_rate_hz").value)
+        tip_period = 1.0 / max(tip_rate, 0.1)
+        self.create_timer(tip_period, self._sample_tip_error,
+                          callback_group=self.cb_group)
+
         # Persistent worker — wakes on mode changes and plans+executes.
         self._worker_thread = threading.Thread(
             target=self._worker_loop, daemon=True, name="bone_peak_worker",
@@ -366,6 +414,103 @@ class BonePeakNavNode(Node):
                 continue
             target_pos = peak_w + np.array([0.0, 0.0, self.standoff])
             pub.publish(self._make_pose_stamped(target_pos, self._drill_quat_global_z))
+
+    # ── Tip-error logging ─────────────────────────────────────────────
+
+    def _current_tracked_bone(self):
+        """Bone currently being driven, or None if idle/paused."""
+        with self._mode_cv:
+            if self._paused or self._mode == MODE_IDLE:
+                return None
+            if self._mode == MODE_OSCILLATE:
+                return self._osc_next
+            return self._mode  # "femur" or "tibia"
+
+    def _sample_tip_error(self):
+        """Log the distance between the commanded tip target and the
+        actual drill frame position. Only fires while a bone is being
+        actively tracked (not idle, not paused)."""
+        bone = self._current_tracked_bone()
+        if bone is None:
+            return
+
+        peak_w = self._get_locked_world_peak(bone)
+        if peak_w is None:
+            return
+        target_pos = peak_w + np.array([0.0, 0.0, self.standoff])
+
+        # Actual drill tip: origin of the `drill` frame in base frame.
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                BASE_FRAME, DRILL_FRAME, rclpy.time.Time(),
+                rclpy.duration.Duration(seconds=0.05),
+            )
+        except Exception:
+            return
+        drill_pos = np.array([
+            tf.transform.translation.x,
+            tf.transform.translation.y,
+            tf.transform.translation.z,
+        ])
+        err = float(np.linalg.norm(target_pos - drill_pos))
+
+        stamp = self.get_clock().now().to_msg()
+        t_sec = stamp.sec + stamp.nanosec * 1e-9
+        target_mm = target_pos * 1000.0
+        drill_mm = drill_pos * 1000.0
+        err_mm = err * 1000.0
+        self._tip_error_buffer.append(
+            f"{t_sec:.6f}\t{bone}\t"
+            f"{target_mm[0]:.3f}\t{target_mm[1]:.3f}\t{target_mm[2]:.3f}\t"
+            f"{drill_mm[0]:.3f}\t{drill_mm[1]:.3f}\t{drill_mm[2]:.3f}\t"
+            f"{err_mm:.3f}\n"
+        )
+        if len(self._tip_error_buffer) >= self._tip_error_flush_every:
+            self._flush_tip_error_buffer()
+
+    def _flush_tip_error_buffer(self):
+        if not self._tip_error_buffer:
+            return
+        try:
+            self._tip_error_log_file.writelines(self._tip_error_buffer)
+            self._tip_error_log_file.flush()
+        except Exception as e:
+            self.get_logger().warn(f"Tip-error flush failed: {e}")
+            return
+        self._tip_error_buffer = []
+
+    def _session_dir_cb(self, msg):
+        """Hot-swap the tip-error log file into session_dir/tip_error.tsv."""
+        session_dir = msg.data
+        if not session_dir:
+            return
+        try:
+            os.makedirs(session_dir, exist_ok=True)
+        except Exception as e:
+            self.get_logger().warn(
+                f"Could not create session dir {session_dir}: {e}")
+            return
+
+        new_path = os.path.join(session_dir, "tip_error.tsv")
+        if self._tip_error_log_path == new_path:
+            return
+
+        self._flush_tip_error_buffer()
+        try:
+            self._tip_error_log_file.close()
+        except Exception:
+            pass
+
+        self._tip_error_log_file = open(new_path, "a")
+        if os.path.getsize(new_path) == 0:
+            self._tip_error_log_file.write(
+                "# ros_time_s\tbone\ttarget_x_mm\ttarget_y_mm\ttarget_z_mm"
+                "\tdrill_x_mm\tdrill_y_mm\tdrill_z_mm\terr_mm\n"
+            )
+            self._tip_error_log_file.flush()
+        self._tip_error_log_path = new_path
+        self.get_logger().info(
+            f"Tip-error log redirected into session: {new_path}")
 
     # ── Command dispatch ──────────────────────────────────────────────
 
@@ -642,6 +787,11 @@ def main(args=None):
         with node._mode_cv:
             node._mode_cv.notify_all()
         node._cancel_active_goal()
+        try:
+            node._flush_tip_error_buffer()
+            node._tip_error_log_file.close()
+        except Exception:
+            pass
         node.destroy_node()
         rclpy.shutdown()
 

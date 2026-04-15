@@ -46,8 +46,9 @@ from sksurgerynditracker.nditracker import NDITracker
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from geometry_msgs.msg import PoseStamped, TransformStamped
-from std_msgs.msg import Float64
+from std_msgs.msg import Float64, String
 from ament_index_python.packages import get_package_share_directory
 from tf2_ros import TransformBroadcaster
 
@@ -191,15 +192,21 @@ class IRTrackingNode(Node):
         # ── ROS 2 Parameters ──────────────────────────────────────────────
         self.declare_parameter('hz', 50.0)
         self.declare_parameter('vega_ip', '')
+        # Fallback dir used until /session/dir arrives from detect_and_merge_node.
         self.declare_parameter(
             'drift_log_dir',
-            '/home/kneepolean/AUTOKnee-server/detect_output')
+            os.path.expanduser('~/detect_output'))
+        # How many samples to buffer before flushing to disk.
+        self.declare_parameter('drift_flush_every', 25)
 
         hz = self.get_parameter('hz').value
         vega_ip = self.get_parameter('vega_ip').value
         if not vega_ip:
             vega_ip = None
-        drift_log_dir = self.get_parameter('drift_log_dir').value
+        drift_log_dir = os.path.expanduser(
+            self.get_parameter('drift_log_dir').value)
+        self._drift_flush_every = int(
+            self.get_parameter('drift_flush_every').value)
 
         # ── Resolve ROM files ────────────────────────────────────────────
         self.romfiles = []
@@ -258,13 +265,30 @@ class IRTrackingNode(Node):
         self.tf_broadcaster = TransformBroadcaster(self)
 
         # ── Drift log file ───────────────────────────────────────────────
+        # Start in the fallback dir so samples before /session/dir arrives
+        # are still captured. When the session path is published by
+        # detect_and_merge_node, we hot-swap the log file into it.
         os.makedirs(drift_log_dir, exist_ok=True)
-        log_name = time.strftime('drift_%Y%m%d_%H%M%S.txt')
-        self._drift_log_path = os.path.join(drift_log_dir, log_name)
+        pending_name = time.strftime('drift_pending_%Y%m%d_%H%M%S.tsv')
+        self._drift_log_path = os.path.join(drift_log_dir, pending_name)
         self._drift_log_file = open(self._drift_log_path, 'w')
         self._drift_log_file.write('# ros_time_s\tdrift_mm\n')
         self._drift_log_file.flush()
-        self.get_logger().info(f"Logging drift to {self._drift_log_path}")
+        self._drift_buffer = []  # list[str] — pending lines, flushed in batches
+        self.get_logger().info(
+            f"Logging drift to {self._drift_log_path} "
+            f"(will redirect when /session/dir arrives)")
+
+        # Latched subscription to session folder path. detect_and_merge_node
+        # publishes this on startup with TRANSIENT_LOCAL durability, so we
+        # get it even if we subscribe after the fact.
+        session_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        self.create_subscription(
+            String, '/session/dir', self._session_dir_cb, session_qos)
 
         # ── Timers ───────────────────────────────────────────────────────
         self.create_timer(1.0 / hz, self._poll_and_publish)
@@ -277,6 +301,51 @@ class IRTrackingNode(Node):
 
     def _istar_global_cb(self, msg):
         self._latest_istar_global = msg
+
+    # ── /session/dir callback — redirect drift log into the session folder ─
+
+    def _session_dir_cb(self, msg):
+        session_dir = msg.data
+        if not session_dir:
+            return
+        try:
+            os.makedirs(session_dir, exist_ok=True)
+        except Exception as e:
+            self.get_logger().warn(
+                f"  Could not create session dir {session_dir}: {e}")
+            return
+
+        new_path = os.path.join(session_dir, 'drift.tsv')
+        if getattr(self, '_drift_log_path', None) == new_path:
+            return  # already logging into this session
+
+        # Flush any buffered lines to the current (pending) file first.
+        self._flush_drift_buffer()
+        try:
+            self._drift_log_file.close()
+        except Exception:
+            pass
+
+        self._drift_log_file = open(new_path, 'a')
+        if os.path.getsize(new_path) == 0:
+            self._drift_log_file.write('# ros_time_s\tdrift_mm\n')
+            self._drift_log_file.flush()
+        self._drift_log_path = new_path
+        self.get_logger().info(f"Drift log redirected into session: {new_path}")
+
+    # ── Drift flush helper ────────────────────────────────────────────────
+
+    def _flush_drift_buffer(self):
+        buf = getattr(self, '_drift_buffer', None)
+        if not buf:
+            return
+        try:
+            self._drift_log_file.writelines(buf)
+            self._drift_log_file.flush()
+        except Exception as e:
+            self.get_logger().warn(f"  Drift flush failed: {e}")
+            return
+        self._drift_buffer = []
 
     # ── Main loop: poll Vega, calibrate, transform, publish ──────────────
 
@@ -381,9 +450,10 @@ class IRTrackingNode(Node):
             self.drift_pub.publish(msg)
 
             t_sec = stamp.sec + stamp.nanosec * 1e-9
-            self._drift_log_file.write(
+            self._drift_buffer.append(
                 f"{t_sec:.6f}\t{self._drift_m * 1000.0:.6f}\n")
-            self._drift_log_file.flush()
+            if len(self._drift_buffer) >= self._drift_flush_every:
+                self._flush_drift_buffer()
 
     # ── Periodic status log ──────────────────────────────────────────────
 
@@ -412,6 +482,7 @@ class IRTrackingNode(Node):
             self.ndi_tracker = None
         if getattr(self, '_drift_log_file', None):
             try:
+                self._flush_drift_buffer()
                 self._drift_log_file.close()
             except Exception:
                 pass
